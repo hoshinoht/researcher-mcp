@@ -33,3 +33,6 @@ go.work.sum
 
 .DS_Store
 Google-Scholar-MCP-Server/**
+
+# Local build outputs
+bin/

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -19,29 +20,69 @@ func GetAuthorInfo(ctx context.Context, requester *Requester, authorName string)
 	if trimmedName == "" {
 		return nil, &ToolError{Code: "invalid_input", Message: "author_name is required"}
 	}
+	candidates := splitAuthorNameCandidates(trimmedName)
+	if len(candidates) == 0 {
+		return nil, &ToolError{Code: "invalid_input", Message: "author_name is required"}
+	}
 
 	var lastErr *ToolError
+	var firstHardErr *ToolError
+	for _, candidate := range candidates {
+		author, toolErr := getAuthorInfoSingleName(ctx, requester, candidate)
+		if toolErr == nil {
+			return author, nil
+		}
 
-	if author, err := getAuthorInfoFromOpenAlex(ctx, requester, trimmedName); err == nil {
-		return author, nil
-	} else {
-		lastErr = err
+		lastErr = toolErr
+		if toolErr.Code != "no_results" && firstHardErr == nil {
+			firstHardErr = toolErr
+		}
 	}
 
-	if author, err := getAuthorInfoFromCrossref(ctx, requester, trimmedName); err == nil {
-		return author, nil
-	} else {
-		lastErr = err
+	if firstHardErr != nil {
+		return nil, firstHardErr
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 
-	if author, err := getAuthorInfoFromORCID(ctx, requester, trimmedName); err == nil {
+	return nil, &ToolError{Code: "no_results", Message: "author not found"}
+}
+
+func getAuthorInfoSingleName(ctx context.Context, requester *Requester, authorName string) (*AuthorInfo, *ToolError) {
+
+	var lastErr *ToolError
+	var firstHardErr *ToolError
+
+	if author, err := getAuthorInfoFromOpenAlex(ctx, requester, authorName); err == nil {
 		return author, nil
 	} else {
 		lastErr = err
+		if err.Code != "no_results" && firstHardErr == nil {
+			firstHardErr = err
+		}
+	}
+
+	if author, err := getAuthorInfoFromCrossref(ctx, requester, authorName); err == nil {
+		return author, nil
+	} else {
+		lastErr = err
+		if err.Code != "no_results" && firstHardErr == nil {
+			firstHardErr = err
+		}
+	}
+
+	if author, err := getAuthorInfoFromORCID(ctx, requester, authorName); err == nil {
+		return author, nil
+	} else {
+		lastErr = err
+		if err.Code != "no_results" && firstHardErr == nil {
+			firstHardErr = err
+		}
 	}
 
 	// Scholar is now a final fallback only.
-	if author, err := getAuthorInfoFromScholar(ctx, requester, trimmedName); err == nil {
+	if author, err := getAuthorInfoFromScholar(ctx, requester, authorName); err == nil {
 		author.Source = "google_scholar"
 		if author.ExternalIDs == nil {
 			author.ExternalIDs = map[string]string{}
@@ -49,16 +90,57 @@ func GetAuthorInfo(ctx context.Context, requester *Requester, authorName string)
 		return author, nil
 	} else {
 		lastErr = err
+		if err.Code != "no_results" && firstHardErr == nil {
+			firstHardErr = err
+		}
 	}
 
+	if firstHardErr != nil {
+		return nil, firstHardErr
+	}
 	if lastErr == nil {
 		return nil, &ToolError{Code: "no_results", Message: "author not found"}
 	}
 	return nil, lastErr
 }
 
+func splitAuthorNameCandidates(authorName string) []string {
+	trimmed := normalizeSpace(authorName)
+	if trimmed == "" {
+		return nil
+	}
+
+	parts := strings.Split(trimmed, ",")
+	if len(parts) == 1 {
+		return []string{trimmed}
+	}
+
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		name := normalizeSpace(part)
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, name)
+	}
+
+	if len(out) == 0 {
+		return []string{trimmed}
+	}
+	return out
+}
+
 type openAlexAuthorResponse struct {
-	Results []struct {
+	Results []openAlexAuthorResult `json:"results"`
+}
+
+type openAlexAuthorResult struct {
 		ID           string `json:"id"`
 		ORCID        string `json:"orcid"`
 		DisplayName  string `json:"display_name"`
@@ -74,7 +156,6 @@ type openAlexAuthorResponse struct {
 			DisplayName string  `json:"display_name"`
 			Score       float64 `json:"score"`
 		} `json:"x_concepts"`
-	} `json:"results"`
 }
 
 type openAlexWorksResponse struct {
@@ -86,7 +167,7 @@ type openAlexWorksResponse struct {
 }
 
 func getAuthorInfoFromOpenAlex(ctx context.Context, requester *Requester, authorName string) (*AuthorInfo, *ToolError) {
-	searchURL := "https://api.openalex.org/authors?search=" + url.QueryEscape(authorName) + "&per-page=1"
+	searchURL := "https://api.openalex.org/authors?search=" + url.QueryEscape(authorName) + "&per-page=10"
 	body, status, err := requester.Get(ctx, searchURL)
 	if err != nil {
 		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("openalex author search failed: %v", err)}
@@ -103,7 +184,7 @@ func getAuthorInfoFromOpenAlex(ctx context.Context, requester *Requester, author
 		return nil, &ToolError{Code: "no_results", Message: "openalex author not found"}
 	}
 
-	r := resp.Results[0]
+	r := chooseBestOpenAlexAuthor(resp.Results, authorName)
 	affiliation := "N/A"
 	if len(r.Affiliations) > 0 && strings.TrimSpace(r.Affiliations[0].Institution.DisplayName) != "" {
 		affiliation = r.Affiliations[0].Institution.DisplayName
@@ -168,6 +249,97 @@ func getAuthorInfoFromOpenAlex(ctx context.Context, requester *Requester, author
 		Source:       "openalex",
 		ExternalIDs:  externalIDs,
 	}, nil
+}
+
+func chooseBestOpenAlexAuthor(results []openAlexAuthorResult, requestedName string) openAlexAuthorResult {
+	if len(results) == 0 {
+		return openAlexAuthorResult{}
+	}
+	target := canonicalPersonName(requestedName)
+	if target == "" {
+		return results[0]
+	}
+
+	bestIdx := 0
+	bestScore := -1
+	bestCitations := -1
+
+	for i, result := range results {
+		score := nameMatchScore(target, canonicalPersonName(result.DisplayName))
+		if score > bestScore || (score == bestScore && result.CitedByCount > bestCitations) {
+			bestIdx = i
+			bestScore = score
+			bestCitations = result.CitedByCount
+		}
+	}
+
+	return results[bestIdx]
+}
+
+func canonicalPersonName(name string) string {
+	name = normalizeSpace(strings.ToLower(name))
+	if name == "" {
+		return ""
+	}
+
+	b := strings.Builder{}
+	for _, r := range name {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte(' ')
+	}
+
+	return normalizeSpace(b.String())
+}
+
+func nameMatchScore(target, candidate string) int {
+	if target == "" || candidate == "" {
+		return 0
+	}
+	if target == candidate {
+		return 1000
+	}
+
+	score := 0
+	if strings.Contains(candidate, target) || strings.Contains(target, candidate) {
+		score += 200
+	}
+
+	targetTokens := strings.Fields(target)
+	candidateTokens := strings.Fields(candidate)
+	if len(targetTokens) == 0 || len(candidateTokens) == 0 {
+		return score
+	}
+
+	candidateSet := make(map[string]struct{}, len(candidateTokens))
+	for _, token := range candidateTokens {
+		candidateSet[token] = struct{}{}
+	}
+
+	overlap := 0
+	for _, token := range targetTokens {
+		if _, ok := candidateSet[token]; ok {
+			overlap++
+		}
+	}
+	score += overlap * 40
+
+	if targetTokens[0] == candidateTokens[0] {
+		score += 20
+	}
+	if targetTokens[len(targetTokens)-1] == candidateTokens[len(candidateTokens)-1] {
+		score += 20
+	}
+
+	if len(targetTokens) > len(candidateTokens) {
+		score -= (len(targetTokens) - len(candidateTokens)) * 5
+	} else {
+		score -= (len(candidateTokens) - len(targetTokens)) * 5
+	}
+
+	return score
 }
 
 type crossrefWorksResponse struct {
