@@ -5,6 +5,9 @@ type PaperResult struct {
 	Authors          string `json:"authors"`
 	Abstract         string `json:"abstract"`
 	URL              string `json:"url"`
+	DOI              string `json:"doi,omitempty"`
+	Year             int    `json:"year,omitempty"`
+	PDFURL           string `json:"pdf_url,omitempty"`
 	SnippetTruncated bool   `json:"snippet_truncated"`
 }
 

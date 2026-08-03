@@ -26,6 +26,11 @@ This project evolved from a Google Scholar-focused port into a provider-first Re
 	- Input: author_name
 	- Output: author object and optional error object
 	- Source order: OpenAlex, Crossref, ORCID, then Google Scholar fallback
+- get_paper_fulltext (alias: read_research_paper)
+	- Input: url, doi, arxiv_id, or title (at least one), plus optional max_chars and offset for pagination
+	- Output: the paper's full text as markdown with source metadata, or an error object
+	- Resolution order: direct URL, arXiv (HTML first, then PDF), OpenAlex open-access locations, Unpaywall (requires SCHOLAR_CONTACT_EMAIL)
+	- PDF conversion uses poppler's pdftotext when available, with a pure-Go fallback (converter field reports which ran)
 - google_scholar_healthcheck
 	- Input: none
 	- Output: server status message
@@ -107,6 +112,12 @@ Copy .env.example values into your runtime environment as needed:
 - SCHOLAR_PROXY_LIST
 - SCHOLAR_TIMEOUT_SECONDS
 
+Full-text extraction settings:
+
+- SCHOLAR_CONTACT_EMAIL: joins the OpenAlex polite pool and enables the Unpaywall fallback
+- SCHOLAR_MAX_FETCH_MB: max document download size in MB (default 30)
+- SCHOLAR_PDFTOTEXT_PATH: path to poppler's pdftotext; empty auto-detects on PATH, "off" forces pure-Go extraction
+
 ## API Keys And Rate Limits
 
 Researcher MCP works without API credentials, but provider-side anonymous usage can be rate-limited.
@@ -143,6 +154,7 @@ Preferred tool aliases:
 - search_research_articles
 - search_research_articles_advanced
 - get_researcher_info
+- read_research_paper
 - researcher_mcp_healthcheck
 
 ## Development

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"googlescholar-mcp-go/internal/config"
+	"googlescholar-mcp-go/internal/fulltext"
 	"googlescholar-mcp-go/internal/scholar"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -14,6 +15,7 @@ import (
 type Server struct {
 	sdkServer *mcp.Server
 	requester *scholar.Requester
+	fulltext  *fulltext.Service
 	implName  string
 	implVer   string
 }
@@ -34,6 +36,15 @@ type GetAuthorInput struct {
 	AuthorName string `json:"author_name" jsonschema:"author display name"`
 }
 
+type GetPaperContentInput struct {
+	URL      string `json:"url,omitempty" jsonschema:"direct URL to the paper (landing page or PDF)"`
+	DOI      string `json:"doi,omitempty" jsonschema:"DOI, e.g. 10.1038/nature14539"`
+	ArxivID  string `json:"arxiv_id,omitempty" jsonschema:"arXiv identifier, e.g. 1706.03762"`
+	Title    string `json:"title,omitempty" jsonschema:"paper title (resolved via OpenAlex; less reliable than DOI or URL)"`
+	MaxChars int    `json:"max_chars,omitempty" jsonschema:"max markdown characters to return (default 40000, max 150000)"`
+	Offset   int    `json:"offset,omitempty" jsonschema:"character offset for pagination (use next_offset from the previous call)"`
+}
+
 type SearchResponse struct {
 	Results []scholar.PaperResult `json:"results"`
 	Error   *scholar.ToolError    `json:"error,omitempty"`
@@ -42,6 +53,11 @@ type SearchResponse struct {
 type AuthorResponse struct {
 	Author *scholar.AuthorInfo `json:"author,omitempty"`
 	Error  *scholar.ToolError  `json:"error,omitempty"`
+}
+
+type PaperContentResponse struct {
+	Content *fulltext.PaperContent `json:"content,omitempty"`
+	Error   *scholar.ToolError     `json:"error,omitempty"`
 }
 
 type HealthResponse struct {
@@ -55,6 +71,7 @@ func New(cfg config.Config, version string) *Server {
 		implVer:   version,
 		requester: scholar.NewRequester(cfg),
 	}
+	s.fulltext = fulltext.NewService(s.requester, cfg)
 
 	s.sdkServer = mcp.NewServer(&mcp.Implementation{Name: s.implName, Version: s.implVer}, nil)
 
@@ -62,12 +79,14 @@ func New(cfg config.Config, version string) *Server {
 	mcp.AddTool(s.sdkServer, &mcp.Tool{Name: "search_google_scholar_advanced", Description: "Search scholarly articles (Google Scholar first, OpenAlex fallback) with author/year filters"}, s.searchAdvanced)
 	mcp.AddTool(s.sdkServer, &mcp.Tool{Name: "get_author_info", Description: "Get researcher metadata via OpenAlex/Crossref/ORCID with Scholar fallback"}, s.getAuthorInfo)
 	mcp.AddTool(s.sdkServer, &mcp.Tool{Name: "google_scholar_healthcheck", Description: "Check Researcher MCP process health and runtime mode"}, s.healthcheck)
+	mcp.AddTool(s.sdkServer, &mcp.Tool{Name: "get_paper_fulltext", Description: "Fetch a paper's full text as markdown by URL, DOI, arXiv ID, or title (open-access sources; paginated via max_chars/offset)"}, s.getPaperContent)
 
 	// Researcher MCP aliases (preferred names).
 	mcp.AddTool(s.sdkServer, &mcp.Tool{Name: "search_research_articles", Description: "Search scholarly articles (Google Scholar first, OpenAlex fallback) using keyword queries"}, s.searchKeywords)
 	mcp.AddTool(s.sdkServer, &mcp.Tool{Name: "search_research_articles_advanced", Description: "Search scholarly articles (Google Scholar first, OpenAlex fallback) with author/year filters"}, s.searchAdvanced)
 	mcp.AddTool(s.sdkServer, &mcp.Tool{Name: "get_researcher_info", Description: "Get researcher metadata via OpenAlex/Crossref/ORCID with Scholar fallback"}, s.getAuthorInfo)
 	mcp.AddTool(s.sdkServer, &mcp.Tool{Name: "researcher_mcp_healthcheck", Description: "Check Researcher MCP process health and runtime mode"}, s.healthcheck)
+	mcp.AddTool(s.sdkServer, &mcp.Tool{Name: "read_research_paper", Description: "Fetch a paper's full text as markdown by URL, DOI, arXiv ID, or title (open-access sources; paginated via max_chars/offset)"}, s.getPaperContent)
 
 	return s
 }
@@ -118,6 +137,27 @@ func (s *Server) getAuthorInfo(ctx context.Context, _ *mcp.CallToolRequest, inpu
 	}
 
 	return nil, AuthorResponse{Author: author}, nil
+}
+
+func (s *Server) getPaperContent(ctx context.Context, _ *mcp.CallToolRequest, input GetPaperContentInput) (*mcp.CallToolResult, PaperContentResponse, error) {
+	if strings.TrimSpace(input.URL) == "" && strings.TrimSpace(input.DOI) == "" && strings.TrimSpace(input.ArxivID) == "" && strings.TrimSpace(input.Title) == "" {
+		return nil, PaperContentResponse{Error: &scholar.ToolError{
+			Code:    "invalid_input",
+			Message: "at least one of url, doi, arxiv_id, or title is required",
+		}}, nil
+	}
+
+	content, toolErr := s.fulltext.GetPaperContent(ctx, fulltext.Request{
+		URL:     input.URL,
+		DOI:     input.DOI,
+		ArxivID: input.ArxivID,
+		Title:   input.Title,
+	}, input.MaxChars, input.Offset)
+	if toolErr != nil {
+		return nil, PaperContentResponse{Error: toolErr}, nil
+	}
+
+	return nil, PaperContentResponse{Content: content}, nil
 }
 
 func (s *Server) healthcheck(_ context.Context, _ *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, HealthResponse, error) {

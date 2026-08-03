@@ -1,0 +1,21 @@
+{
+  "display_name": "Deep Residual Learning for Image Recognition",
+  "doi": "https://doi.org/10.1109/cvpr.2016.90",
+  "primary_location": {
+    "landing_page_url": "https://doi.org/10.1109/cvpr.2016.90",
+    "pdf_url": null
+  },
+  "best_oa_location": {
+    "landing_page_url": "https://publisher.example.org/article/123",
+    "pdf_url": "https://publisher.example.org/article/123.pdf"
+  },
+  "open_access": {
+    "oa_url": "https://repo.example.org/oa/123.pdf"
+  },
+  "locations": [
+    {
+      "landing_page_url": "https://publisher.example.org/article/123",
+      "pdf_url": "https://publisher.example.org/article/123.pdf"
+    }
+  ]
+}

@@ -16,6 +16,9 @@ type Config struct {
 	UserAgents       []string
 	ProxyList        []string
 	Timeout          time.Duration
+	ContactEmail     string
+	MaxFetchBytes    int64
+	PdftotextPath    string
 }
 
 var defaultUserAgents = []string{
@@ -50,6 +53,11 @@ func Load() Config {
 	proxyList := getEnvCSV("SCHOLAR_PROXY_LIST")
 	timeout := getEnvDurationSeconds("SCHOLAR_TIMEOUT_SECONDS", 25)
 
+	maxFetchMB := getEnvInt("SCHOLAR_MAX_FETCH_MB", 30)
+	if maxFetchMB < 1 {
+		maxFetchMB = 30
+	}
+
 	return Config{
 		MinDelay:         minDelay,
 		MaxDelay:         maxDelay,
@@ -59,6 +67,9 @@ func Load() Config {
 		UserAgents:       userAgents,
 		ProxyList:        proxyList,
 		Timeout:          timeout,
+		ContactEmail:     strings.TrimSpace(os.Getenv("SCHOLAR_CONTACT_EMAIL")),
+		MaxFetchBytes:    int64(maxFetchMB) * 1024 * 1024,
+		PdftotextPath:    strings.TrimSpace(os.Getenv("SCHOLAR_PDFTOTEXT_PATH")),
 	}
 }
 

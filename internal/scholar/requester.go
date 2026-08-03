@@ -108,6 +108,89 @@ func (r *Requester) Get(ctx context.Context, rawURL string) ([]byte, int, error)
 	}
 }
 
+// FetchedDoc is the result of GetDocument: a size-capped body plus the
+// metadata needed to decide how to interpret it.
+type FetchedDoc struct {
+	Body        []byte
+	ContentType string
+	FinalURL    string
+	Status      int
+}
+
+// ErrBodyTooLarge is returned by GetDocument when a response exceeds the
+// configured MaxFetchBytes limit.
+var ErrBodyTooLarge = fmt.Errorf("response body exceeds SCHOLAR_MAX_FETCH_MB limit")
+
+// GetDocument fetches a document (PDF or HTML) with the same rate-limit,
+// retry, and user-agent machinery as Get, but accepts PDFs, caps the body
+// size, and reports the final URL after redirects.
+func (r *Requester) GetDocument(ctx context.Context, rawURL string) (*FetchedDoc, error) {
+	attempt := 0
+
+	for {
+		attempt++
+		if err := r.sleepForRateLimit(rawURL); err != nil {
+			return nil, err
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("User-Agent", r.pickUserAgent())
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("Accept", "application/pdf,text/html;q=0.9,*/*;q=0.8")
+		req.Header.Set("Connection", "keep-alive")
+
+		resp, err := r.client.Do(req)
+		if err != nil {
+			if attempt >= r.cfg.MaxRetries {
+				return nil, err
+			}
+			if sleepErr := r.sleepForBackoff(attempt); sleepErr != nil {
+				return nil, sleepErr
+			}
+			continue
+		}
+
+		maxBytes := r.cfg.MaxFetchBytes
+		if maxBytes <= 0 {
+			maxBytes = 30 * 1024 * 1024
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+		closeErr := resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		if int64(len(body)) > maxBytes {
+			return nil, ErrBodyTooLarge
+		}
+
+		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusServiceUnavailable) && attempt < r.cfg.MaxRetries {
+			if sleepErr := r.sleepForBackoff(attempt); sleepErr != nil {
+				return nil, sleepErr
+			}
+			continue
+		}
+
+		finalURL := rawURL
+		if resp.Request != nil && resp.Request.URL != nil {
+			finalURL = resp.Request.URL.String()
+		}
+
+		return &FetchedDoc{
+			Body:        body,
+			ContentType: resp.Header.Get("Content-Type"),
+			FinalURL:    finalURL,
+			Status:      resp.StatusCode,
+		}, nil
+	}
+}
+
 func (r *Requester) sleepForRateLimit(rawURL string) error {
 	host := hostFromURL(rawURL)
 	now := time.Now()

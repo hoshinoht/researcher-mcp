@@ -103,6 +103,9 @@ type openAlexWorkResult struct {
 		LandingPageURL string `json:"landing_page_url"`
 		PDFURL         string `json:"pdf_url"`
 	} `json:"primary_location"`
+	BestOALocation *struct {
+		PDFURL string `json:"pdf_url"`
+	} `json:"best_oa_location"`
 }
 
 func searchOpenAlex(ctx context.Context, requester *Requester, query, author string, yearRange []int, numResults int) ([]PaperResult, *ToolError) {
@@ -149,11 +152,22 @@ func searchOpenAlex(ctx context.Context, requester *Requester, query, author str
 			resultURL = "No link available"
 		}
 
+		pdfURL := ""
+		if item.BestOALocation != nil {
+			pdfURL = strings.TrimSpace(item.BestOALocation.PDFURL)
+		}
+		if pdfURL == "" {
+			pdfURL = strings.TrimSpace(item.PrimaryLocation.PDFURL)
+		}
+
 		results = append(results, PaperResult{
 			Title:            title,
 			Authors:          authors,
 			Abstract:         abstract,
 			URL:              resultURL,
+			DOI:              normalizeDOIString(item.DOI),
+			Year:             item.PublicationYear,
+			PDFURL:           pdfURL,
 			SnippetTruncated: false,
 		})
 	}
@@ -207,6 +221,13 @@ func openAlexAuthorsToString(authorships []openAlexAuthorship) string {
 		names = append(names, name)
 	}
 	return strings.Join(names, ", ")
+}
+
+func normalizeDOIString(raw string) string {
+	doi := strings.TrimSpace(raw)
+	doi = strings.TrimPrefix(doi, "https://doi.org/")
+	doi = strings.TrimPrefix(doi, "http://doi.org/")
+	return doi
 }
 
 func openAlexResultURL(item openAlexWorkResult) string {
