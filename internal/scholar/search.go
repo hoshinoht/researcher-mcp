@@ -9,16 +9,25 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
 )
 
 func SearchByKeywords(ctx context.Context, requester *Requester, query string, numResults int) ([]PaperResult, *ToolError) {
+	if batchQuery, ok := quotedTitleBatchQuery(query); ok {
+		return searchOpenAlex(ctx, requester, batchQuery, "", nil, numResults)
+	}
+
 	searchURL := buildSearchURL(query, "", nil)
 	return searchWithFallback(ctx, requester, searchURL, query, "", nil, numResults)
 }
 
 func SearchAdvanced(ctx context.Context, requester *Requester, query, author string, yearRange []int, numResults int) ([]PaperResult, *ToolError) {
+	if batchQuery, ok := quotedTitleBatchQuery(query); ok {
+		return searchOpenAlex(ctx, requester, batchQuery, author, yearRange, numResults)
+	}
+
 	searchURL := buildSearchURL(query, author, yearRange)
 	return searchWithFallback(ctx, requester, searchURL, query, author, yearRange, numResults)
 }
@@ -204,6 +213,45 @@ func buildOpenAlexSearchURL(query, author string, yearRange []int, numResults in
 	}
 
 	return "https://api.openalex.org/works?" + params.Encode()
+}
+
+func quotedTitleBatchQuery(query string) (string, bool) {
+	remaining := strings.TrimSpace(query)
+	phrases := make([]string, 0, 2)
+
+	for remaining != "" {
+		if !strings.HasPrefix(remaining, `"`) {
+			return "", false
+		}
+
+		end := strings.IndexByte(remaining[1:], '"')
+		if end < 0 {
+			return "", false
+		}
+		end++
+
+		phrase := remaining[:end+1]
+		if strings.TrimSpace(phrase[1:len(phrase)-1]) == "" {
+			return "", false
+		}
+		phrases = append(phrases, phrase)
+
+		remaining = remaining[end+1:]
+		if remaining == "" {
+			break
+		}
+
+		next := strings.TrimLeftFunc(remaining, unicode.IsSpace)
+		if len(next) == len(remaining) {
+			return "", false
+		}
+		remaining = next
+	}
+
+	if len(phrases) < 2 {
+		return "", false
+	}
+	return strings.Join(phrases, " OR "), true
 }
 
 func openAlexAuthorsToString(authorships []openAlexAuthorship) string {

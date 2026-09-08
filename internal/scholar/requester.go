@@ -21,6 +21,7 @@ type Requester struct {
 
 	mu         sync.Mutex
 	lastByHost map[string]time.Time
+	rateGates  map[string]chan struct{}
 	rng        *rand.Rand
 }
 
@@ -63,7 +64,7 @@ func (r *Requester) Get(ctx context.Context, rawURL string) ([]byte, int, error)
 
 	for {
 		attempt++
-		if err := r.sleepForRateLimit(rawURL); err != nil {
+		if err := r.sleepForRateLimit(ctx, rawURL); err != nil {
 			return nil, 0, err
 		}
 
@@ -82,7 +83,7 @@ func (r *Requester) Get(ctx context.Context, rawURL string) ([]byte, int, error)
 			if attempt >= r.cfg.MaxRetries {
 				return nil, 0, err
 			}
-			if sleepErr := r.sleepForBackoff(attempt); sleepErr != nil {
+			if sleepErr := r.sleepForBackoff(ctx, attempt); sleepErr != nil {
 				return nil, 0, sleepErr
 			}
 			continue
@@ -97,8 +98,8 @@ func (r *Requester) Get(ctx context.Context, rawURL string) ([]byte, int, error)
 			return nil, resp.StatusCode, closeErr
 		}
 
-		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusServiceUnavailable) && attempt < r.cfg.MaxRetries {
-			if sleepErr := r.sleepForBackoff(attempt); sleepErr != nil {
+		if shouldRetryStatus(rawURL, resp.StatusCode) && attempt < r.cfg.MaxRetries {
+			if sleepErr := r.sleepForBackoff(ctx, attempt); sleepErr != nil {
 				return nil, resp.StatusCode, sleepErr
 			}
 			continue
@@ -129,7 +130,7 @@ func (r *Requester) GetDocument(ctx context.Context, rawURL string) (*FetchedDoc
 
 	for {
 		attempt++
-		if err := r.sleepForRateLimit(rawURL); err != nil {
+		if err := r.sleepForRateLimit(ctx, rawURL); err != nil {
 			return nil, err
 		}
 
@@ -148,7 +149,7 @@ func (r *Requester) GetDocument(ctx context.Context, rawURL string) (*FetchedDoc
 			if attempt >= r.cfg.MaxRetries {
 				return nil, err
 			}
-			if sleepErr := r.sleepForBackoff(attempt); sleepErr != nil {
+			if sleepErr := r.sleepForBackoff(ctx, attempt); sleepErr != nil {
 				return nil, sleepErr
 			}
 			continue
@@ -170,8 +171,8 @@ func (r *Requester) GetDocument(ctx context.Context, rawURL string) (*FetchedDoc
 			return nil, ErrBodyTooLarge
 		}
 
-		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusServiceUnavailable) && attempt < r.cfg.MaxRetries {
-			if sleepErr := r.sleepForBackoff(attempt); sleepErr != nil {
+		if shouldRetryStatus(rawURL, resp.StatusCode) && attempt < r.cfg.MaxRetries {
+			if sleepErr := r.sleepForBackoff(ctx, attempt); sleepErr != nil {
 				return nil, sleepErr
 			}
 			continue
@@ -191,9 +192,19 @@ func (r *Requester) GetDocument(ctx context.Context, rawURL string) (*FetchedDoc
 	}
 }
 
-func (r *Requester) sleepForRateLimit(rawURL string) error {
+func (r *Requester) sleepForRateLimit(ctx context.Context, rawURL string) error {
 	host := hostFromURL(rawURL)
-	now := time.Now()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	gate := r.rateLimitGate(host)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+	}
+	defer func() { gate <- struct{}{} }()
 
 	r.mu.Lock()
 	last := r.lastByHost[host]
@@ -203,29 +214,77 @@ func (r *Requester) sleepForRateLimit(rawURL string) error {
 		jitter := time.Duration(r.rng.Int63n(int64(delta)))
 		delay = r.cfg.MinDelay + jitter
 	}
+	r.mu.Unlock()
+
+	now := time.Now()
 	target := last.Add(delay)
 	if target.Before(now) {
+		r.mu.Lock()
 		r.lastByHost[host] = now
 		r.mu.Unlock()
 		return nil
 	}
-	wait := target.Sub(now)
-	r.lastByHost[host] = target
-	r.mu.Unlock()
 
-	time.Sleep(wait)
+	if err := sleepWithContext(ctx, target.Sub(now)); err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	r.lastByHost[host] = time.Now()
+	r.mu.Unlock()
 	return nil
 }
 
-func (r *Requester) sleepForBackoff(attempt int) error {
+func (r *Requester) rateLimitGate(host string) chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.rateGates == nil {
+		r.rateGates = make(map[string]chan struct{})
+	}
+	if gate := r.rateGates[host]; gate != nil {
+		return gate
+	}
+
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	r.rateGates[host] = gate
+	return gate
+}
+
+func (r *Requester) sleepForBackoff(ctx context.Context, attempt int) error {
 	base := math.Pow(r.cfg.BackoffFactor, float64(attempt))
+	r.mu.Lock()
 	jitter := float64(r.cfg.MinDelay) * r.rng.Float64()
+	r.mu.Unlock()
 	d := time.Duration(base*float64(time.Second) + jitter)
 	if d > 30*time.Second {
 		d = 30 * time.Second
 	}
-	time.Sleep(d)
-	return nil
+	return sleepWithContext(ctx, d)
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func shouldRetryStatus(rawURL string, status int) bool {
+	if status != http.StatusTooManyRequests && status != http.StatusForbidden && status != http.StatusServiceUnavailable {
+		return false
+	}
+	return hostFromURL(rawURL) != "scholar.google.com"
 }
 
 func (r *Requester) pickUserAgent() string {

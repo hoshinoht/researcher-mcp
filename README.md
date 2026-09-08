@@ -8,6 +8,7 @@ This project evolved from a Google Scholar-focused port into a provider-first Re
 
 - Adds anti-blocking request behavior for Scholar access (delay jitter, retries, UA rotation, optional proxies).
 - Uses generic article search fallback: Google Scholar first, then OpenAlex when Scholar is blocked or has no usable results.
+- A query made only of two or more double-quoted titles separated by whitespace (for example, `"Title One" "Title Two"`) is searched as an OpenAlex title batch; Boolean operators and mixed text remain ordinary queries.
 - Returns structured tool errors with explicit error codes.
 - Preserves existing tool names for compatibility with existing MCP clients.
 - Adds a healthcheck tool so users can verify the server is alive.
