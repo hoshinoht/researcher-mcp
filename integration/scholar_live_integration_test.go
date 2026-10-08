@@ -49,15 +49,16 @@ func TestSearchByKeywordsWithIEEECitationQueries(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 			defer cancel()
 
-			results, toolErr := scholar.SearchByKeywords(ctx, requester, query, 3)
+			outcome, toolErr := scholar.SearchByKeywords(ctx, requester, query, 3)
 			if toolErr != nil {
 				if toolErr.Code == "blocked" {
-					t.Skipf("live request was blocked by Scholar: %s", toolErr.Message)
+					t.Skipf("live request was blocked: %s (attempts %+v)", toolErr.Message, toolErr.Attempts)
 				}
 				t.Fatalf("unexpected tool error: %+v", toolErr)
 			}
+			t.Logf("provider=%s attempts=%+v", outcome.Provider, outcome.Attempts)
 
-			if len(results) == 0 {
+			if len(outcome.Results) == 0 {
 				t.Fatalf("expected at least one result for query %q", query)
 			}
 		})
@@ -71,7 +72,7 @@ func TestAdvancedSearchUsingCitationContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
 
-	results, toolErr := scholar.SearchAdvanced(
+	outcome, toolErr := scholar.SearchAdvanced(
 		ctx,
 		requester,
 		"Digital health interventions to support family caregivers",
@@ -86,10 +87,11 @@ func TestAdvancedSearchUsingCitationContext(t *testing.T) {
 		t.Fatalf("unexpected tool error: %+v", toolErr)
 	}
 
-	if len(results) == 0 {
+	if len(outcome.Results) == 0 {
 		t.Fatalf("expected results for advanced citation-driven query")
 	}
-	logJSON(t, "advanced_results", results)
+	t.Logf("provider=%s", outcome.Provider)
+	logJSON(t, "advanced_results", outcome.Results)
 }
 
 func TestGetAuthorInfoUsingCitationAuthor(t *testing.T) {
@@ -103,10 +105,16 @@ func TestGetAuthorInfoUsingCitationAuthor(t *testing.T) {
 	var lastNoResultsErr *scholar.ToolError
 	for _, candidate := range candidates {
 		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
-		author, toolErr := scholar.GetAuthorInfo(ctx, requester, candidate)
+		author, toolErr := scholar.GetAuthorInfo(ctx, requester, scholar.AuthorQuery{Name: candidate})
 		cancel()
 
 		if toolErr != nil {
+			if toolErr.Code == "ambiguous" {
+				// Same-name profiles are reported rather than guessed; that is
+				// the intended outcome for common names.
+				logJSON(t, "ambiguous_candidates_"+candidate, toolErr.Candidates)
+				return
+			}
 			if toolErr.Code == "blocked" {
 				t.Skipf("live request was blocked by Scholar while querying %q: %s", candidate, toolErr.Message)
 			}

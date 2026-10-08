@@ -1,0 +1,11 @@
+{"results":[
+ {"id":"https://openalex.org/W10","display_name":"Attention Is All You Need In Speech Separation","publication_year":2021,"doi":"https://doi.org/10.1109/icassp39728.2021.9413901",
+  "authorships":[{"author":{"id":"https://openalex.org/A10","display_name":"Cem Subakan"}}],
+  "best_oa_location":{"is_oa":true,"pdf_url":"https://wrong.example.org/speech.pdf"}},
+ {"id":"https://openalex.org/W11","display_name":"Attention Is All You Need","publication_year":2017,"doi":"https://doi.org/10.48550/arxiv.1706.03762",
+  "authorships":[{"author":{"id":"https://openalex.org/A11","display_name":"Ashish Vaswani"}}],
+  "locations":[{"is_oa":true,"landing_page_url":"https://arxiv.org/abs/1706.03762","pdf_url":"https://arxiv.org/pdf/1706.03762"}]},
+ {"id":"https://openalex.org/W12","display_name":"Attention is all you need","publication_year":2017,
+  "authorships":[{"author":{"id":"https://openalex.org/A11","display_name":"Ashish Vaswani"}}],
+  "best_oa_location":{"is_oa":true,"version":"publishedVersion","pdf_url":"https://papers.example.org/nips2017.pdf"}}
+]}

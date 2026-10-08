@@ -2,39 +2,78 @@ package fulltext
 
 import (
 	"context"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"googlescholar-mcp-go/internal/scholar"
 )
 
-// fakeFetcher serves canned responses keyed by URL substring.
+// fakeFetcher serves canned responses keyed by URL substring; the longest
+// matching key wins so overlapping keys are deterministic.
 type fakeFetcher struct {
+	mu        sync.Mutex
 	responses map[string]*scholar.FetchedDoc
 	errs      map[string]error
 	calls     []string
+	// delay is applied to every fetch (honouring context cancellation).
+	delay time.Duration
 }
 
-func (f *fakeFetcher) GetDocument(_ context.Context, rawURL string) (*scholar.FetchedDoc, error) {
+func longestMatch[T any](m map[string]T, rawURL string) (T, bool) {
+	var (
+		best    T
+		bestLen = -1
+	)
+	for key, v := range m {
+		if strings.Contains(rawURL, key) && len(key) > bestLen {
+			best, bestLen = v, len(key)
+		}
+	}
+	return best, bestLen >= 0
+}
+
+func (f *fakeFetcher) GetDocument(ctx context.Context, rawURL string) (*scholar.FetchedDoc, error) {
+	f.mu.Lock()
 	f.calls = append(f.calls, rawURL)
-	for key, err := range f.errs {
-		if strings.Contains(rawURL, key) {
-			return nil, err
+	delay := f.delay
+	f.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
 		}
 	}
-	for key, doc := range f.responses {
-		if strings.Contains(rawURL, key) {
-			out := *doc
-			if out.FinalURL == "" {
-				out.FinalURL = rawURL
-			}
-			return &out, nil
+	if err, ok := longestMatch(f.errs, rawURL); ok {
+		return nil, err
+	}
+	if doc, ok := longestMatch(f.responses, rawURL); ok {
+		out := *doc
+		if out.FinalURL == "" {
+			out.FinalURL = rawURL
+		}
+		return &out, nil
+	}
+	return &scholar.FetchedDoc{Status: 404, Body: []byte("not found"), FinalURL: rawURL}, nil
+}
+
+func (f *fakeFetcher) callsSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string{}, f.calls...)
+}
+
+func (f *fakeFetcher) called(substr string) bool {
+	for _, c := range f.callsSnapshot() {
+		if strings.Contains(c, substr) {
+			return true
 		}
 	}
-	return &scholar.FetchedDoc{Status: http.StatusNotFound, FinalURL: rawURL}, nil
+	return false
 }
 
 func loadFixture(t *testing.T, name string) []byte {
@@ -44,6 +83,14 @@ func loadFixture(t *testing.T, name string) []byte {
 		t.Fatalf("read fixture %s: %v", name, err)
 	}
 	return data
+}
+
+func candidateURLs(res *resolution) []string {
+	out := []string{}
+	for _, c := range res.sortedCandidates() {
+		out = append(out, c.URL)
+	}
+	return out
 }
 
 func TestNormalizeArxivID(t *testing.T) {
@@ -77,7 +124,7 @@ func TestNormalizeDOI(t *testing.T) {
 	}{
 		{"10.1038/nature14539", "10.1038/nature14539", true},
 		{"https://doi.org/10.1038/nature14539", "10.1038/nature14539", true},
-		{"doi:10.1109/CVPR.2016.90", "10.1109/CVPR.2016.90", true},
+		{"doi:10.1109/CVPR.2016.90", "10.1109/cvpr.2016.90", true},
 		{"nature14539", "", false},
 		{"10.1038/", "", false},
 	}
@@ -108,75 +155,83 @@ func TestArxivIDFromURLPath(t *testing.T) {
 	}
 }
 
-func TestResolveArxivIDProducesHTMLFirstChain(t *testing.T) {
-	res, toolErr := resolve(context.Background(), &fakeFetcher{}, "", Request{ArxivID: "1706.03762"})
+func TestResolveArxivIDCandidates(t *testing.T) {
+	f := &fakeFetcher{}
+	res, toolErr := resolve(context.Background(), f, "", Request{ArxivID: "1706.03762"})
 	if toolErr != nil {
 		t.Fatalf("resolve error: %+v", toolErr)
 	}
-	want := []string{
-		"https://arxiv.org/html/1706.03762",
-		"https://ar5iv.labs.arxiv.org/html/1706.03762",
-		"https://arxiv.org/pdf/1706.03762",
+	got := candidateURLs(res)
+	want := arxivCandidates("1706.03762")
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("candidates = %v, want %v", got, want)
 	}
-	if len(res.Candidates) != len(want) {
-		t.Fatalf("candidates = %v, want %v", res.Candidates, want)
+	if len(f.callsSnapshot()) != 0 {
+		t.Fatalf("arXiv-only requests should not spend an OpenAlex call: %v", f.callsSnapshot())
 	}
-	for i := range want {
-		if res.Candidates[i] != want[i] {
-			t.Fatalf("candidates[%d] = %q, want %q", i, res.Candidates[i], want[i])
-		}
+	if res.Identity.Match.Method != "arxiv_id" {
+		t.Fatalf("match = %+v", res.Identity.Match)
 	}
 }
 
-func TestResolveDOIOrdersOpenAlexLocations(t *testing.T) {
+func TestResolveDOIUsesOpenAlexLocations(t *testing.T) {
 	fetcher := &fakeFetcher{responses: map[string]*scholar.FetchedDoc{
 		"api.openalex.org/works/": {Status: 200, Body: loadFixture(t, "openalex_work.json")},
 	}}
 
-	res, toolErr := resolve(context.Background(), fetcher, "", Request{DOI: "10.1109/cvpr.2016.90"})
+	res, toolErr := resolve(context.Background(), fetcher, "", Request{DOI: "10.1109/CVPR.2016.90"})
 	if toolErr != nil {
 		t.Fatalf("resolve error: %+v", toolErr)
 	}
-	if res.Title != "Deep Residual Learning for Image Recognition" {
-		t.Fatalf("title = %q", res.Title)
+	if res.Identity.Title != "Deep Residual Learning for Image Recognition" || res.Identity.DOI != "10.1109/cvpr.2016.90" {
+		t.Fatalf("identity = %+v", res.Identity)
 	}
 	want := []string{
 		"https://publisher.example.org/article/123.pdf",
 		"https://repo.example.org/oa/123.pdf",
 		"https://publisher.example.org/article/123",
+		"https://doi.org/10.1109/cvpr.2016.90",
 	}
-	if len(res.Candidates) != len(want) {
-		t.Fatalf("candidates = %v, want %v", res.Candidates, want)
-	}
-	for i := range want {
-		if res.Candidates[i] != want[i] {
-			t.Fatalf("candidates[%d] = %q, want %q", i, res.Candidates[i], want[i])
-		}
+	if got := candidateURLs(res); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("candidates = %v, want %v", got, want)
 	}
 }
 
-func TestResolveDOIRoutesArxivWorksToArxivChain(t *testing.T) {
+func TestResolveDOIKeepsAlternativesBesideArxiv(t *testing.T) {
 	fetcher := &fakeFetcher{responses: map[string]*scholar.FetchedDoc{
-		"api.openalex.org/works/": {Status: 200, Body: loadFixture(t, "openalex_work_arxiv.json")},
+		"api.openalex.org/works/": {Status: 200, Body: loadFixture(t, "openalex_work_arxiv_and_repo.json")},
 	}}
-
-	res, toolErr := resolve(context.Background(), fetcher, "", Request{DOI: "10.48550/arxiv.1706.03762"})
+	res, toolErr := resolve(context.Background(), fetcher, "", Request{DOI: "10.1000/robust"})
 	if toolErr != nil {
 		t.Fatalf("resolve error: %+v", toolErr)
 	}
-	if res.Candidates[0] != "https://arxiv.org/html/1706.03762" {
-		t.Fatalf("candidates[0] = %q, want arXiv HTML first", res.Candidates[0])
+	got := candidateURLs(res)
+	want := []string{
+		"https://arxiv.org/html/2001.00001",
+		"https://ar5iv.labs.arxiv.org/html/2001.00001",
+		"https://arxiv.org/pdf/2001.00001",
+		"https://repository.example.edu/bitstream/30/robust.pdf",
+		"https://repository.example.edu/item/30",
+		"https://doi.org/10.1000/robust",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("candidates = %v\nwant %v", got, want)
+	}
+	if res.Identity.ArxivID != "2001.00001" || res.Identity.OpenAlexID != "W30" {
+		t.Fatalf("identity = %+v", res.Identity)
 	}
 }
 
-func TestResolveDOIUnknownReturnsNoResults(t *testing.T) {
+func TestResolveDOIUnknownStillTriesDOILanding(t *testing.T) {
 	fetcher := &fakeFetcher{responses: map[string]*scholar.FetchedDoc{
 		"api.openalex.org/works/": {Status: 404, Body: []byte(`{"error":"not found"}`)},
 	}}
-
-	_, toolErr := resolve(context.Background(), fetcher, "", Request{DOI: "10.9999/does.not.exist"})
-	if toolErr == nil || toolErr.Code != "no_results" {
-		t.Fatalf("toolErr = %+v, want no_results", toolErr)
+	res, toolErr := resolve(context.Background(), fetcher, "", Request{DOI: "10.9999/does.not.exist"})
+	if toolErr != nil {
+		t.Fatalf("resolve error: %+v", toolErr)
+	}
+	if got := candidateURLs(res); len(got) != 1 || got[0] != "https://doi.org/10.9999/does.not.exist" {
+		t.Fatalf("candidates = %v", got)
 	}
 }
 
@@ -189,38 +244,124 @@ func TestResolveDOIURLIsTreatedAsDOI(t *testing.T) {
 	if toolErr != nil {
 		t.Fatalf("resolve error: %+v", toolErr)
 	}
-	if len(res.Candidates) == 0 || !strings.HasSuffix(res.Candidates[0], "123.pdf") {
-		t.Fatalf("candidates = %v", res.Candidates)
+	if got := candidateURLs(res); len(got) == 0 || !strings.HasSuffix(got[0], "123.pdf") {
+		t.Fatalf("candidates = %v", got)
 	}
 }
 
-func TestResolveTitleUsesOpenAlexSearch(t *testing.T) {
-	body := []byte(`{"results":[` + string(loadFixture(t, "openalex_work.json")) + `]}`)
+func TestResolveTitleRejectsWrongFirstResult(t *testing.T) {
 	fetcher := &fakeFetcher{responses: map[string]*scholar.FetchedDoc{
-		"api.openalex.org/works?": {Status: 200, Body: body},
+		"api.openalex.org/works?": {Status: 200, Body: loadFixture(t, "openalex_title_wrong_first.json")},
 	}}
-
-	res, toolErr := resolve(context.Background(), fetcher, "", Request{Title: "Deep Residual Learning"})
+	res, toolErr := resolve(context.Background(), fetcher, "", Request{Title: "Attention Is All You Need"})
 	if toolErr != nil {
 		t.Fatalf("resolve error: %+v", toolErr)
 	}
-	if res.Title != "Deep Residual Learning for Image Recognition" {
-		t.Fatalf("title = %q", res.Title)
+	if res.Identity.OpenAlexID != "W11" || res.Identity.ArxivID != "1706.03762" {
+		t.Fatalf("identity = %+v; the first (wrong) search hit must not win", res.Identity)
 	}
-	if len(res.Candidates) != 3 {
-		t.Fatalf("candidates = %v", res.Candidates)
+	if res.Identity.Match.Method != "title_exact" || res.Identity.Match.Confidence != "medium" {
+		t.Fatalf("match = %+v", res.Identity.Match)
+	}
+	urls := candidateURLs(res)
+	for _, u := range urls {
+		if strings.Contains(u, "wrong.example.org") {
+			t.Fatalf("candidates include the wrong paper: %v", urls)
+		}
+	}
+	// The second version record (same title, same author) contributes its
+	// location as an alternative.
+	if !strings.Contains(strings.Join(urls, ","), "papers.example.org/nips2017.pdf") {
+		t.Fatalf("version location missing: %v", urls)
+	}
+}
+
+func TestResolveTitleAmbiguousWithoutEvidence(t *testing.T) {
+	fetcher := &fakeFetcher{responses: map[string]*scholar.FetchedDoc{
+		"api.openalex.org/works?": {Status: 200, Body: loadFixture(t, "openalex_title_two_papers.json")},
+	}}
+	_, toolErr := resolve(context.Background(), fetcher, "", Request{Title: "Deep learning"})
+	if toolErr == nil || toolErr.Code != scholar.CodeAmbiguous {
+		t.Fatalf("toolErr = %+v, want ambiguous", toolErr)
+	}
+	if len(toolErr.Candidates) != 2 || toolErr.Candidates[0].DOI == "" {
+		t.Fatalf("candidates = %+v", toolErr.Candidates)
+	}
+
+	res, toolErr := resolve(context.Background(), fetcher, "", Request{Title: "Deep learning", Author: "Goodfellow"})
+	if toolErr != nil {
+		t.Fatalf("with author evidence: %+v", toolErr)
+	}
+	if res.Identity.DOI != "10.5555/goodfellow" || res.Identity.Match.Confidence != "high" {
+		t.Fatalf("identity = %+v", res.Identity)
+	}
+
+	res, toolErr = resolve(context.Background(), fetcher, "", Request{Title: "Deep learning", Year: 2015})
+	if toolErr != nil || res.Identity.DOI != "10.1038/nature14539" {
+		t.Fatalf("with year evidence: %+v %+v", res, toolErr)
+	}
+}
+
+func TestResolveTitleNoCloseMatch(t *testing.T) {
+	fetcher := &fakeFetcher{responses: map[string]*scholar.FetchedDoc{
+		"api.openalex.org/works?": {Status: 200, Body: loadFixture(t, "openalex_title_two_papers.json")},
+	}}
+	_, toolErr := resolve(context.Background(), fetcher, "", Request{Title: "Quantum chromodynamics on the lattice"})
+	if toolErr == nil || toolErr.Code != scholar.CodeNoResults {
+		t.Fatalf("toolErr = %+v, want no_results", toolErr)
+	}
+}
+
+func TestResolveTitleFallsBackToCrossrefDuringOpenAlexOutage(t *testing.T) {
+	fetcher := &fakeFetcher{responses: map[string]*scholar.FetchedDoc{
+		"api.openalex.org/works?": {Status: 503, Body: []byte("down")},
+		"api.crossref.org/works?": {Status: 200, Body: []byte(`{"message":{"items":[{"DOI":"10.1000/XYZ","title":["Resilient Systems"],"author":[{"given":"Ann","family":"Smith"}],"issued":{"date-parts":[[2019]]}}]}}`)},
+	}}
+	res, toolErr := resolve(context.Background(), fetcher, "", Request{Title: "Resilient systems"})
+	if toolErr != nil {
+		t.Fatalf("resolve error: %+v", toolErr)
+	}
+	if res.Identity.DOI != "10.1000/xyz" || len(res.Warnings) == 0 {
+		t.Fatalf("identity = %+v warnings = %v", res.Identity, res.Warnings)
+	}
+}
+
+func TestResolveDetectsConflictingIdentifiers(t *testing.T) {
+	fetcher := &fakeFetcher{responses: map[string]*scholar.FetchedDoc{
+		"api.openalex.org/works/": {Status: 200, Body: loadFixture(t, "openalex_work_arxiv_and_repo.json")},
+	}}
+	cases := []struct {
+		name string
+		req  Request
+	}{
+		{"doi vs arxiv location", Request{DOI: "10.1000/robust", ArxivID: "1706.03762"}},
+		{"arxiv doi vs arxiv id", Request{DOI: "10.48550/arXiv.2001.00001", ArxivID: "1706.03762"}},
+		{"doi url vs doi", Request{URL: "https://doi.org/10.1000/a", DOI: "10.1000/b"}},
+		{"title vs doi", Request{DOI: "10.1000/robust", Title: "An entirely unrelated title about birds"}},
+	}
+	for _, c := range cases {
+		_, toolErr := resolve(context.Background(), fetcher, "", c.req)
+		if toolErr == nil || toolErr.Code != scholar.CodeIdentifierConflict {
+			t.Errorf("%s: toolErr = %+v, want identifier_conflict", c.name, toolErr)
+		}
+	}
+	// Matching identifiers are fine.
+	if _, toolErr := resolve(context.Background(), fetcher, "", Request{DOI: "10.1000/robust", ArxivID: "2001.00001v2", Title: "Robust paper"}); toolErr != nil {
+		t.Fatalf("consistent identifiers rejected: %+v", toolErr)
 	}
 }
 
 func TestResolveInvalidInputs(t *testing.T) {
 	for _, req := range []Request{
+		{URL: "not a url"},
+		{URL: "ftp://example.org/paper.pdf"},
+		{DOI: "nope"},
+		{ArxivID: "nope"},
+		{OpenAlexID: "A123"},
 		{},
-		{ArxivID: "banana"},
-		{DOI: "not-a-doi"},
-		{URL: "ftp://example.org/x"},
 	} {
 		_, toolErr := resolve(context.Background(), &fakeFetcher{}, "", req)
-		if toolErr == nil || toolErr.Code != "invalid_input" {
+		if toolErr == nil || toolErr.Code != scholar.CodeInvalidInput {
 			t.Errorf("resolve(%+v) toolErr = %+v, want invalid_input", req, toolErr)
 		}
 	}

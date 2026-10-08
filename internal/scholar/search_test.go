@@ -108,9 +108,13 @@ func TestSearchAdvanced_QuotedTitleBatchBypassesScholar(t *testing.T) {
 		}
 	}))
 
-	results, toolErr := SearchAdvanced(context.Background(), requester, `"First Title" "Second Title"`, "Ada Lovelace", []int{2025, 2020}, 5)
+	outcome, toolErr := SearchAdvanced(context.Background(), requester, `"First Title" "Second Title"`, "Ada Lovelace", []int{2025, 2020}, 5)
 	if toolErr != nil {
 		t.Fatalf("SearchAdvanced returned tool error: %+v", toolErr)
+	}
+	results := outcome.Results
+	if outcome.Provider != "openalex" || results[0].Source != "openalex" {
+		t.Fatalf("provider = %q, source = %q, want openalex", outcome.Provider, results[0].Source)
 	}
 	if len(results) != 1 || results[0].Title != "Batch result" {
 		t.Fatalf("unexpected results: %+v", results)
@@ -143,9 +147,13 @@ func TestSearchByKeywords_BooleanQueryRemainsScholarSearch(t *testing.T) {
 		}
 	}))
 
-	results, toolErr := SearchByKeywords(context.Background(), requester, query, 5)
+	outcome, toolErr := SearchByKeywords(context.Background(), requester, query, 5)
 	if toolErr != nil {
 		t.Fatalf("SearchByKeywords returned tool error: %+v", toolErr)
+	}
+	results := outcome.Results
+	if outcome.Provider != "scholar" || results[0].Source != "google_scholar" {
+		t.Fatalf("provider = %q, source = %q, want scholar", outcome.Provider, results[0].Source)
 	}
 	if len(results) != 1 {
 		t.Fatalf("results = %d, want 1", len(results))
@@ -185,9 +193,13 @@ func TestSearchByKeywords_BlockedScholarFallsBackWithoutRetry(t *testing.T) {
 			requester.cfg.MaxRetries = 3
 			requester.cfg.BackoffFactor = 0
 
-			results, toolErr := SearchByKeywords(context.Background(), requester, "ordinary query", 5)
+			outcome, toolErr := SearchByKeywords(context.Background(), requester, "ordinary query", 5)
 			if toolErr != nil {
 				t.Fatalf("SearchByKeywords returned tool error: %+v", toolErr)
+			}
+			results := outcome.Results
+			if len(outcome.Attempts) != 2 || outcome.Attempts[0].Outcome != "blocked" {
+				t.Fatalf("attempts = %+v, want blocked scholar then openalex", outcome.Attempts)
 			}
 			if len(results) != 1 || results[0].Title != "Fallback result" {
 				t.Fatalf("unexpected results: %+v", results)
@@ -231,8 +243,7 @@ func TestRequester_RetriesBlockedStatusForOtherHosts(t *testing.T) {
 
 func TestRequesterWaitsRespectCanceledContext(t *testing.T) {
 	requester := newTestRequester(nil)
-	requester.cfg.MinDelay = time.Second
-	requester.cfg.MaxDelay = time.Second
+	requester.cfg.DocumentMinInterval = time.Second
 	original := time.Now()
 	requester.lastByHost["example.org"] = original
 
@@ -245,8 +256,8 @@ func TestRequesterWaitsRespectCanceledContext(t *testing.T) {
 	if got := requester.lastByHost["example.org"]; !got.Equal(original) {
 		t.Fatalf("last request time = %v, want cancellation rollback to %v", got, original)
 	}
-	if err := requester.sleepForBackoff(ctx, 1); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("sleepForBackoff error = %v, want context.DeadlineExceeded", err)
+	if requester.waitForRetry(ctx, time.Second) {
+		t.Fatal("waitForRetry slept past the context deadline")
 	}
 }
 

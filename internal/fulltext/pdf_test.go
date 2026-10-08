@@ -78,10 +78,11 @@ func TestConvertPDFWithPdftotext(t *testing.T) {
 		t.Skip("pdftotext not installed")
 	}
 
-	text, converter, err := convertPDF(context.Background(), config.Config{}, makeTestPDF(t, testPDFLines))
+	out, err := convertPDF(context.Background(), config.Config{}, makeTestPDF(t, testPDFLines), 0)
 	if err != nil {
 		t.Fatalf("convertPDF error: %v", err)
 	}
+	text, converter := cleanExtractedText(out.joined()), out.Converter
 	if converter != converterPdftotext {
 		t.Fatalf("converter = %q, want %q", converter, converterPdftotext)
 	}
@@ -94,10 +95,11 @@ func TestConvertPDFWithPdftotext(t *testing.T) {
 }
 
 func TestConvertPDFFallbackWhenDisabled(t *testing.T) {
-	text, converter, err := convertPDF(context.Background(), config.Config{PdftotextPath: "off"}, makeTestPDF(t, testPDFLines))
+	out, err := convertPDF(context.Background(), config.Config{PdftotextPath: "off"}, makeTestPDF(t, testPDFLines), 0)
 	if err != nil {
 		t.Fatalf("convertPDF error: %v", err)
 	}
+	text, converter := out.joined(), out.Converter
 	if converter != converterGoPDF {
 		t.Fatalf("converter = %q, want %q", converter, converterGoPDF)
 	}
@@ -113,7 +115,7 @@ func TestCleanExtractedText(t *testing.T) {
 		want string
 	}{
 		{"dehyphenate", "extrac-\ntion works", "extraction works"},
-		{"formfeed", "page one\fpage two", "page one\n\n---\n\npage two"},
+		{"formfeed", "page one\fpage two", "page one\n\npage two"},
 		{"collapse", "a\n\n\n\n\nb", "a\n\nb"},
 		{"heading plain", "Abstract\nbody text", "## Abstract\nbody text"},
 		{"heading numbered", "3.1 Results\nbody", "## 3.1 Results\nbody"},

@@ -54,6 +54,7 @@ Preferred tool aliases:
 - search_research_articles_advanced
 - get_researcher_info
 - researcher_mcp_healthcheck
+- read_research_paper
 
 Compatibility tool names are also supported:
 
@@ -61,3 +62,20 @@ Compatibility tool names are also supported:
 - search_google_scholar_advanced
 - get_author_info
 - google_scholar_healthcheck
+- get_paper_fulltext
+
+Both sets are registered by default. To give OpenCode a smaller catalog, set
+`RESEARCHER_TOOL_SET=preferred` (or `legacy`) in the server's environment:
+
+```json
+{
+  "mcpServers": {
+    "researcher-mcp": {
+      "type": "stdio",
+      "command": "/absolute/path/to/researcher-mcp",
+      "args": [],
+      "env": { "RESEARCHER_TOOL_SET": "preferred", "OPENALEX_API_KEY": "..." }
+    }
+  }
+}
+```

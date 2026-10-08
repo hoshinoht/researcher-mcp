@@ -8,464 +8,781 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
 )
 
-func GetAuthorInfo(ctx context.Context, requester *Requester, authorName string) (*AuthorInfo, *ToolError) {
-	trimmedName := strings.TrimSpace(authorName)
-	if trimmedName == "" {
-		return nil, &ToolError{Code: "invalid_input", Message: "author_name is required"}
-	}
-	candidates := splitAuthorNameCandidates(trimmedName)
-	if len(candidates) == 0 {
-		return nil, &ToolError{Code: "invalid_input", Message: "author_name is required"}
-	}
-
-	var lastErr *ToolError
-	var firstHardErr *ToolError
-	for _, candidate := range candidates {
-		author, toolErr := getAuthorInfoSingleName(ctx, requester, candidate)
-		if toolErr == nil {
-			return author, nil
-		}
-
-		lastErr = toolErr
-		if toolErr.Code != "no_results" && firstHardErr == nil {
-			firstHardErr = toolErr
-		}
-	}
-
-	if firstHardErr != nil {
-		return nil, firstHardErr
-	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-
-	return nil, &ToolError{Code: "no_results", Message: "author not found"}
+// AuthorQuery identifies a researcher. Exact identifiers (ORCID, OpenAlex
+// author ID) take precedence over names; affiliation and a known paper are
+// optional evidence for choosing between same-name people.
+type AuthorQuery struct {
+	Name        string
+	ORCID       string
+	OpenAlexID  string
+	Affiliation string
+	// KnownPaper is a DOI or title of a paper the researcher authored.
+	KnownPaper string
 }
 
-func getAuthorInfoSingleName(ctx context.Context, requester *Requester, authorName string) (*AuthorInfo, *ToolError) {
+const (
+	confidenceHigh   = "high"
+	confidenceMedium = "medium"
+	confidenceLow    = "low"
 
-	var lastErr *ToolError
-	var firstHardErr *ToolError
+	maxAuthorCandidates = 8
+	authorSampleSize    = 5
+)
 
-	if author, err := getAuthorInfoFromOpenAlex(ctx, requester, authorName); err == nil {
-		return author, nil
+// GetAuthorInfo resolves a researcher and returns profile metadata. When the
+// evidence cannot single out one person it returns an "ambiguous" error with
+// candidates instead of guessing.
+func GetAuthorInfo(ctx context.Context, requester *Requester, q AuthorQuery) (*AuthorInfo, *ToolError) {
+	q.Name = normalizeSpace(q.Name)
+	q.Affiliation = normalizeSpace(q.Affiliation)
+	q.KnownPaper = normalizeSpace(q.KnownPaper)
+
+	var warnings []string
+	if q.ORCID != "" {
+		id, ok := NormalizeORCID(q.ORCID)
+		if !ok {
+			return nil, &ToolError{Code: CodeInvalidInput, Message: fmt.Sprintf("invalid ORCID iD: %q", q.ORCID), Hint: "Expected 0000-0000-0000-000X (checksum is validated)."}
+		}
+		q.ORCID = id
+	}
+	if q.OpenAlexID != "" {
+		id, ok := NormalizeOpenAlexID(q.OpenAlexID)
+		if !ok || !strings.HasPrefix(id, "A") {
+			return nil, &ToolError{Code: CodeInvalidInput, Message: fmt.Sprintf("invalid OpenAlex author ID: %q", q.OpenAlexID), Hint: "Expected A followed by digits, e.g. A5023888391."}
+		}
+		q.OpenAlexID = id
+	}
+	if q.Name != "" {
+		people := SplitPeople(q.Name)
+		if len(people) == 0 {
+			return nil, &ToolError{Code: CodeInvalidInput, Message: "author_name is required"}
+		}
+		if len(people) > 1 {
+			warnings = append(warnings, fmt.Sprintf("author_name lists %d people; only the first (%q) was looked up. Query the others separately.", len(people), people[0]))
+		}
+		q.Name = DisplayOrder(people[0])
+	}
+	if q.Name == "" && q.ORCID == "" && q.OpenAlexID == "" {
+		return nil, &ToolError{Code: CodeInvalidInput, Message: "author_name, orcid or openalex_id is required"}
+	}
+
+	var (
+		author  *AuthorInfo
+		toolErr *ToolError
+	)
+	if q.ORCID != "" || q.OpenAlexID != "" {
+		author, toolErr = resolveAuthorByIdentifier(ctx, requester, q)
 	} else {
-		lastErr = err
-		if err.Code != "no_results" && firstHardErr == nil {
-			firstHardErr = err
-		}
+		author, toolErr = resolveAuthorByName(ctx, requester, q)
 	}
-
-	if author, err := getAuthorInfoFromCrossref(ctx, requester, authorName); err == nil {
-		return author, nil
-	} else {
-		lastErr = err
-		if err.Code != "no_results" && firstHardErr == nil {
-			firstHardErr = err
-		}
+	if toolErr != nil {
+		return nil, toolErr
 	}
-
-	if author, err := getAuthorInfoFromORCID(ctx, requester, authorName); err == nil {
-		return author, nil
-	} else {
-		lastErr = err
-		if err.Code != "no_results" && firstHardErr == nil {
-			firstHardErr = err
-		}
+	author.Warnings = append(warnings, author.Warnings...)
+	if author.Metrics.CitedByCount != nil {
+		author.CitedBy = IntPtr(*author.Metrics.CitedByCount)
 	}
-
-	// Scholar is now a final fallback only.
-	if author, err := getAuthorInfoFromScholar(ctx, requester, authorName); err == nil {
-		author.Source = "google_scholar"
-		if author.ExternalIDs == nil {
-			author.ExternalIDs = map[string]string{}
-		}
-		return author, nil
-	} else {
-		lastErr = err
-		if err.Code != "no_results" && firstHardErr == nil {
-			firstHardErr = err
-		}
+	if author.ExternalIDs == nil {
+		author.ExternalIDs = map[string]string{}
 	}
-
-	if firstHardErr != nil {
-		return nil, firstHardErr
+	if author.Interests == nil {
+		author.Interests = []string{}
 	}
-	if lastErr == nil {
-		return nil, &ToolError{Code: "no_results", Message: "author not found"}
+	if author.Publications == nil {
+		author.Publications = []Publication{}
 	}
-	return nil, lastErr
+	return author, nil
 }
 
-func splitAuthorNameCandidates(authorName string) []string {
-	trimmed := normalizeSpace(authorName)
-	if trimmed == "" {
-		return nil
-	}
+// ---- OpenAlex ------------------------------------------------------------
 
-	parts := strings.Split(trimmed, ",")
-	if len(parts) == 1 {
-		return []string{trimmed}
-	}
+type openAlexInstitution struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+}
 
-	out := make([]string, 0, len(parts))
-	seen := make(map[string]struct{}, len(parts))
-	for _, part := range parts {
-		name := normalizeSpace(part)
-		if name == "" {
-			continue
+type openAlexAuthorResult struct {
+	ID                      string                `json:"id"`
+	ORCID                   string                `json:"orcid"`
+	DisplayName             string                `json:"display_name"`
+	DisplayNameAlternatives []string              `json:"display_name_alternatives"`
+	WorksCount              *int                  `json:"works_count"`
+	CitedByCount            *int                  `json:"cited_by_count"`
+	LastKnownInstitutions   []openAlexInstitution `json:"last_known_institutions"`
+	Affiliations            []struct {
+		Institution openAlexInstitution `json:"institution"`
+		Years       []int               `json:"years"`
+	} `json:"affiliations"`
+	SummaryStats *struct {
+		HIndex   *int `json:"h_index"`
+		I10Index *int `json:"i10_index"`
+	} `json:"summary_stats"`
+	Topics []struct {
+		DisplayName string `json:"display_name"`
+	} `json:"topics"`
+	XConcepts []struct {
+		DisplayName string  `json:"display_name"`
+		Score       float64 `json:"score"`
+	} `json:"x_concepts"`
+}
+
+func (a openAlexAuthorResult) shortID() string {
+	id, _ := NormalizeOpenAlexID(a.ID)
+	return id
+}
+
+func (a openAlexAuthorResult) orcid() string {
+	id, _ := NormalizeORCID(a.ORCID)
+	return id
+}
+
+func (a openAlexAuthorResult) institutions() []string {
+	out := []string{}
+	seen := map[string]bool{}
+	add := func(name string) {
+		name = normalizeSpace(name)
+		if name != "" && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
 		}
-		key := strings.ToLower(name)
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		out = append(out, name)
 	}
-
-	if len(out) == 0 {
-		return []string{trimmed}
+	for _, inst := range a.LastKnownInstitutions {
+		add(inst.DisplayName)
+	}
+	for _, aff := range a.Affiliations {
+		add(aff.Institution.DisplayName)
 	}
 	return out
+}
+
+// nameMatch is the strongest match between a requested name and the
+// profile's display name or any recorded alternative.
+func (a openAlexAuthorResult) nameMatch(requested string) string {
+	best := CompareNames(requested, a.DisplayName)
+	if best == NameExact {
+		return best
+	}
+	for _, alt := range a.DisplayNameAlternatives {
+		switch CompareNames(requested, alt) {
+		case NameExact:
+			return NameExact
+		case NameCompatible:
+			best = NameCompatible
+		}
+	}
+	return best
 }
 
 type openAlexAuthorResponse struct {
 	Results []openAlexAuthorResult `json:"results"`
 }
 
-type openAlexAuthorResult struct {
-		ID           string `json:"id"`
-		ORCID        string `json:"orcid"`
-		DisplayName  string `json:"display_name"`
-		WorksCount   int    `json:"works_count"`
-		CitedByCount int    `json:"cited_by_count"`
-		WorksAPIURL  string `json:"works_api_url"`
-		Affiliations []struct {
-			Institution struct {
-				DisplayName string `json:"display_name"`
-			} `json:"institution"`
-		} `json:"affiliations"`
-		XConcepts []struct {
-			DisplayName string  `json:"display_name"`
-			Score       float64 `json:"score"`
-		} `json:"x_concepts"`
-}
-
-type openAlexWorksResponse struct {
-	Results []struct {
-		Title           string `json:"title"`
-		PublicationYear int    `json:"publication_year"`
-		CitedByCount    int    `json:"cited_by_count"`
-	} `json:"results"`
-}
-
-func getAuthorInfoFromOpenAlex(ctx context.Context, requester *Requester, authorName string) (*AuthorInfo, *ToolError) {
-	searchURL := "https://api.openalex.org/authors?search=" + url.QueryEscape(authorName) + "&per-page=10"
-	body, status, err := requester.Get(ctx, searchURL)
+func fetchOpenAlexAuthor(ctx context.Context, requester *Requester, idPath string) (*openAlexAuthorResult, int, *ToolError) {
+	body, status, err := requester.GetJSON(ctx, "https://api.openalex.org/authors/"+idPath)
 	if err != nil {
-		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("openalex author search failed: %v", err)}
+		return nil, 0, requestError("openalex", err)
+	}
+	if status == http.StatusNotFound {
+		return nil, status, &ToolError{Code: CodeNoResults, Message: "openalex author not found"}
 	}
 	if status != http.StatusOK {
-		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("openalex author search failed with status %d", status)}
+		return nil, status, statusError("openalex", status)
+	}
+	var a openAlexAuthorResult
+	if err := json.Unmarshal(body, &a); err != nil {
+		return nil, status, &ToolError{Code: CodeParseFailed, Message: fmt.Sprintf("openalex author parse failed: %v", err)}
+	}
+	return &a, status, nil
+}
+
+func resolveAuthorByIdentifier(ctx context.Context, requester *Requester, q AuthorQuery) (*AuthorInfo, *ToolError) {
+	var (
+		profile *openAlexAuthorResult
+		oaErr   *ToolError
+		method  string
+	)
+	if q.OpenAlexID != "" {
+		method = "openalex_id"
+		profile, _, oaErr = fetchOpenAlexAuthor(ctx, requester, q.OpenAlexID)
+		if oaErr == nil && q.ORCID != "" && profile.orcid() != "" && profile.orcid() != q.ORCID {
+			return nil, &ToolError{
+				Code:    CodeIdentifierConflict,
+				Message: fmt.Sprintf("OpenAlex author %s has ORCID %s, but orcid %s was supplied", q.OpenAlexID, profile.orcid(), q.ORCID),
+				Hint:    "Check which identifier is correct and supply only that one.",
+				Candidates: []Candidate{
+					authorCandidate(*profile, nil),
+					{ID: "orcid:" + q.ORCID, Label: "ORCID record " + q.ORCID, ORCID: q.ORCID, Source: "input"},
+				},
+			}
+		}
+	} else {
+		method = "orcid"
+		profile, _, oaErr = fetchOpenAlexAuthor(ctx, requester, "orcid:"+q.ORCID)
 	}
 
+	if oaErr != nil {
+		if ctxErr := ContextError(ctx.Err(), "author lookup"); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if q.ORCID == "" {
+			return nil, oaErr
+		}
+		// The ORCID registry itself is authoritative for an ORCID iD.
+		author, orcidErr := orcidRecord(ctx, requester, q.ORCID)
+		if orcidErr != nil {
+			if MoreInformative(oaErr, orcidErr) {
+				return nil, oaErr
+			}
+			return nil, orcidErr
+		}
+		author.Match = &MatchInfo{Method: "orcid", Confidence: confidenceHigh, Evidence: []string{"ORCID record retrieved by iD"}}
+		author.Warnings = append(author.Warnings, "OpenAlex profile unavailable for this ORCID ("+oaErr.Message+"); metrics unknown")
+		checkSuppliedName(author, q.Name)
+		return author, nil
+	}
+
+	author, toolErr := buildOpenAlexAuthor(ctx, requester, *profile)
+	if toolErr != nil {
+		return nil, toolErr
+	}
+	evidence := []string{"OpenAlex author retrieved by " + strings.ReplaceAll(method, "_", " ")}
+	if q.ORCID != "" && profile.orcid() == q.ORCID {
+		evidence = append(evidence, "ORCID matches the OpenAlex profile")
+	}
+	author.Match = &MatchInfo{Method: method, Confidence: confidenceHigh, Evidence: evidence}
+	if q.Name != "" && profile.nameMatch(q.Name) == NameMismatch {
+		author.Warnings = append(author.Warnings, fmt.Sprintf("supplied author_name %q does not match profile name %q; the identifier was trusted", q.Name, author.Name))
+	}
+	return author, nil
+}
+
+func checkSuppliedName(author *AuthorInfo, name string) {
+	if name != "" && author.Name != "" && CompareNames(name, author.Name) == NameMismatch {
+		author.Warnings = append(author.Warnings, fmt.Sprintf("supplied author_name %q does not match record name %q; the identifier was trusted", name, author.Name))
+	}
+}
+
+func resolveAuthorByName(ctx context.Context, requester *Requester, q AuthorQuery) (*AuthorInfo, *ToolError) {
+	author, best := resolveOpenAlexAuthorByName(ctx, requester, q)
+	if author != nil {
+		return author, nil
+	}
+	if best != nil && !isAuthorFallbackCode(best.Code) {
+		return nil, best
+	}
+	attempts := []Attempt{{Provider: "openalex", Stage: "author_lookup", Outcome: best.Code, Message: best.Message}}
+
+	type provider struct {
+		name string
+		fn   func(context.Context, *Requester, AuthorQuery) (*AuthorInfo, *ToolError)
+	}
+	// Identity-bearing sources first; Crossref has no author profiles, so it
+	// is the last resort and its results are marked unverified.
+	for _, p := range []provider{
+		{"orcid", getAuthorInfoFromORCID},
+		{"google_scholar", getAuthorInfoFromScholar},
+		{"crossref", getAuthorInfoFromCrossref},
+	} {
+		if ctxErr := ContextError(ctx.Err(), "author lookup"); ctxErr != nil {
+			ctxErr.Attempts = attempts
+			return nil, ctxErr
+		}
+		a, err := p.fn(ctx, requester, q)
+		if err == nil {
+			a.Warnings = append(a.Warnings, fmt.Sprintf("resolved via %s fallback after OpenAlex: %s", p.name, best.Message))
+			return a, nil
+		}
+		attempts = AppendAttempt(attempts, Attempt{Provider: p.name, Stage: "author_lookup", Outcome: err.Code, Message: err.Message})
+		if !isAuthorFallbackCode(err.Code) {
+			err.Attempts = attempts
+			return nil, err
+		}
+		if MoreInformative(err, best) {
+			best = err
+		}
+	}
+	out := *best
+	out.Attempts = attempts
+	return nil, &out
+}
+
+// isAuthorFallbackCode reports failures that justify trying the next
+// provider. Ambiguity and identifier conflicts are answers, not failures.
+func isAuthorFallbackCode(code string) bool {
+	switch code {
+	case CodeNoResults, CodeUpstreamError, CodeParseFailed, CodeBlocked:
+		return true
+	default:
+		return false
+	}
+}
+
+type scoredAuthor struct {
+	profile  openAlexAuthorResult
+	name     string
+	evidence []string
+	paper    bool
+	aff      bool
+}
+
+func resolveOpenAlexAuthorByName(ctx context.Context, requester *Requester, q AuthorQuery) (*AuthorInfo, *ToolError) {
+	params := url.Values{}
+	params.Set("search", q.Name)
+	params.Set("per-page", "25")
+	body, status, err := requester.GetJSON(ctx, "https://api.openalex.org/authors?"+params.Encode())
+	if err != nil {
+		return nil, requestError("openalex", err)
+	}
+	if status != http.StatusOK {
+		return nil, statusError("openalex", status)
+	}
 	var resp openAlexAuthorResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, &ToolError{Code: "parse_failed", Message: fmt.Sprintf("openalex author parse failed: %v", err)}
-	}
-	if len(resp.Results) == 0 {
-		return nil, &ToolError{Code: "no_results", Message: "openalex author not found"}
+		return nil, &ToolError{Code: CodeParseFailed, Message: fmt.Sprintf("openalex author parse failed: %v", err)}
 	}
 
-	r := chooseBestOpenAlexAuthor(resp.Results, authorName)
-	affiliation := "N/A"
-	if len(r.Affiliations) > 0 && strings.TrimSpace(r.Affiliations[0].Institution.DisplayName) != "" {
-		affiliation = r.Affiliations[0].Institution.DisplayName
-	}
-
-	interests := make([]string, 0, 5)
-	for _, c := range r.XConcepts {
-		if len(interests) >= 5 {
-			break
-		}
-		topic := normalizeSpace(c.DisplayName)
-		if topic != "" {
-			interests = append(interests, topic)
+	candidates := make([]*scoredAuthor, 0, len(resp.Results))
+	for _, r := range resp.Results {
+		if m := r.nameMatch(q.Name); m != NameMismatch {
+			candidates = append(candidates, &scoredAuthor{profile: r, name: m, evidence: []string{"name " + m}})
 		}
 	}
 
-	publications := make([]Publication, 0, 5)
-	if strings.TrimSpace(r.WorksAPIURL) != "" {
-		worksURL := r.WorksAPIURL + "&per-page=5&sort=cited_by_count:desc"
-		worksBody, worksStatus, worksErr := requester.Get(ctx, worksURL)
-		if worksErr == nil && worksStatus == http.StatusOK {
-			var worksResp openAlexWorksResponse
-			if err := json.Unmarshal(worksBody, &worksResp); err == nil {
-				for _, work := range worksResp.Results {
-					year := "N/A"
-					if work.PublicationYear > 0 {
-						year = strconv.Itoa(work.PublicationYear)
+	var notes []string
+	if q.KnownPaper != "" {
+		authorIDs, paperTitle, paperErr := knownPaperAuthors(ctx, requester, q.KnownPaper)
+		switch {
+		case paperErr != nil:
+			notes = append(notes, "known_paper could not be checked: "+paperErr.Message)
+		default:
+			found := false
+			for _, c := range candidates {
+				if _, ok := authorIDs[c.profile.shortID()]; ok {
+					c.paper = true
+					found = true
+					c.evidence = append(c.evidence, fmt.Sprintf("listed as an author of %q", paperTitle))
+				}
+			}
+			if !found {
+				// The author may not be in the top search results: fetch any
+				// name-compatible author of the known paper directly.
+				for id, name := range authorIDs {
+					if name == "" || CompareNames(q.Name, name) == NameMismatch {
+						continue
 					}
-					title := normalizeSpace(work.Title)
-					if title == "" {
-						title = "N/A"
+					profile, _, fetchErr := fetchOpenAlexAuthor(ctx, requester, id)
+					if fetchErr != nil {
+						continue
 					}
-					publications = append(publications, Publication{
-						Title:     title,
-						Year:      year,
-						Citations: work.CitedByCount,
+					candidates = append(candidates, &scoredAuthor{
+						profile: *profile, name: profile.nameMatch(q.Name), paper: true,
+						evidence: []string{"name " + profile.nameMatch(q.Name), fmt.Sprintf("listed as an author of %q", paperTitle)},
 					})
 				}
 			}
 		}
 	}
 
-	externalIDs := map[string]string{}
-	if strings.TrimSpace(r.ID) != "" {
-		externalIDs["openalex"] = r.ID
-	}
-	if strings.TrimSpace(r.ORCID) != "" {
-		externalIDs["orcid"] = r.ORCID
+	if len(candidates) == 0 {
+		return nil, &ToolError{Code: CodeNoResults, Message: fmt.Sprintf("no OpenAlex author profile matches the name %q", q.Name)}
 	}
 
-	name := normalizeSpace(r.DisplayName)
-	if name == "" {
-		name = authorName
+	if q.Affiliation != "" {
+		for _, c := range candidates {
+			if inst := matchingInstitution(q.Affiliation, c.profile.institutions()); inst != "" {
+				c.aff = true
+				c.evidence = append(c.evidence, fmt.Sprintf("affiliation matches %q", inst))
+			}
+		}
 	}
 
-	return &AuthorInfo{
-		Name:         name,
-		Affiliation:  affiliation,
-		Interests:    interests,
-		CitedBy:      r.CitedByCount,
-		Publications: publications,
+	choose := func(filter func(*scoredAuthor) bool) []*scoredAuthor {
+		out := []*scoredAuthor{}
+		for _, c := range candidates {
+			if filter(c) {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+
+	var (
+		chosen     *scoredAuthor
+		method     string
+		confidence string
+	)
+	paperMatches := choose(func(c *scoredAuthor) bool { return c.paper })
+	affMatches := choose(func(c *scoredAuthor) bool { return c.aff })
+	bothMatches := choose(func(c *scoredAuthor) bool { return c.paper && c.aff })
+
+	switch {
+	case len(bothMatches) == 1:
+		chosen, method, confidence = bothMatches[0], "name+known_paper+affiliation", confidenceHigh
+	case len(paperMatches) == 1:
+		chosen, method, confidence = paperMatches[0], "name+known_paper", confidenceHigh
+	case len(paperMatches) == 0 && len(affMatches) == 1:
+		chosen, method, confidence = affMatches[0], "name+affiliation", confidenceMedium
+	case len(paperMatches) == 0 && len(affMatches) == 0 && len(candidates) == 1:
+		chosen, method = candidates[0], "name_unique"
+		confidence = confidenceMedium
+		if chosen.name != NameExact {
+			confidence = confidenceLow
+		}
+		chosen.evidence = append(chosen.evidence, fmt.Sprintf("only name-compatible profile among %d OpenAlex search results", len(resp.Results)))
+		if q.Affiliation != "" {
+			notes = append(notes, fmt.Sprintf("affiliation %q does not match this profile's recorded institutions", q.Affiliation))
+			confidence = confidenceLow
+		}
+		if q.KnownPaper != "" {
+			notes = append(notes, "the known paper did not confirm this profile")
+			confidence = confidenceLow
+		}
+	}
+
+	if chosen == nil {
+		pool := candidates
+		switch {
+		case len(paperMatches) > 1:
+			pool = paperMatches
+		case len(affMatches) > 1:
+			pool = affMatches
+		}
+		return nil, ambiguousAuthors(q, pool, notes)
+	}
+
+	author, toolErr := buildOpenAlexAuthor(ctx, requester, chosen.profile)
+	if toolErr != nil {
+		return nil, toolErr
+	}
+	author.Match = &MatchInfo{Method: method, Confidence: confidence, Evidence: chosen.evidence}
+	author.Warnings = append(author.Warnings, notes...)
+	return author, nil
+}
+
+func ambiguousAuthors(q AuthorQuery, pool []*scoredAuthor, notes []string) *ToolError {
+	sort.SliceStable(pool, func(i, j int) bool {
+		if (pool[i].name == NameExact) != (pool[j].name == NameExact) {
+			return pool[i].name == NameExact
+		}
+		return derefInt(pool[i].profile.WorksCount) > derefInt(pool[j].profile.WorksCount)
+	})
+	out := make([]Candidate, 0, maxAuthorCandidates)
+	for _, c := range pool {
+		if len(out) >= maxAuthorCandidates {
+			break
+		}
+		out = append(out, authorCandidate(c.profile, c.evidence))
+	}
+	msg := fmt.Sprintf("%d OpenAlex author profiles match %q and the supplied evidence does not single one out", len(pool), q.Name)
+	if len(notes) > 0 {
+		msg += " (" + strings.Join(notes, "; ") + ")"
+	}
+	return &ToolError{
+		Code:       CodeAmbiguous,
+		Message:    msg,
+		Hint:       "Call again with orcid or openalex_id from a candidate, or add affiliation / known_paper evidence. Candidates are ordered by name exactness then works count; that order is not identity evidence.",
+		Candidates: out,
+	}
+}
+
+func authorCandidate(p openAlexAuthorResult, evidence []string) Candidate {
+	insts := p.institutions()
+	aff := ""
+	if len(insts) > 0 {
+		aff = insts[0]
+	}
+	return Candidate{
+		ID:           p.shortID(),
+		Label:        normalizeSpace(p.DisplayName),
+		ORCID:        p.orcid(),
+		Affiliation:  aff,
+		WorksCount:   p.WorksCount,
+		CitedByCount: p.CitedByCount,
+		Evidence:     evidence,
 		Source:       "openalex",
-		ExternalIDs:  externalIDs,
-	}, nil
+	}
 }
 
-func chooseBestOpenAlexAuthor(results []openAlexAuthorResult, requestedName string) openAlexAuthorResult {
-	if len(results) == 0 {
-		return openAlexAuthorResult{}
-	}
-	target := canonicalPersonName(requestedName)
-	if target == "" {
-		return results[0]
-	}
-
-	bestIdx := 0
-	bestScore := -1
-	bestCitations := -1
-
-	for i, result := range results {
-		score := nameMatchScore(target, canonicalPersonName(result.DisplayName))
-		if score > bestScore || (score == bestScore && result.CitedByCount > bestCitations) {
-			bestIdx = i
-			bestScore = score
-			bestCitations = result.CitedByCount
-		}
-	}
-
-	return results[bestIdx]
-}
-
-func canonicalPersonName(name string) string {
-	name = normalizeSpace(strings.ToLower(name))
-	if name == "" {
-		return ""
-	}
-
-	b := strings.Builder{}
-	for _, r := range name {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(r)
-			continue
-		}
-		b.WriteByte(' ')
-	}
-
-	return normalizeSpace(b.String())
-}
-
-func nameMatchScore(target, candidate string) int {
-	if target == "" || candidate == "" {
+func derefInt(p *int) int {
+	if p == nil {
 		return 0
 	}
-	if target == candidate {
-		return 1000
-	}
+	return *p
+}
 
-	score := 0
-	if strings.Contains(candidate, target) || strings.Contains(target, candidate) {
-		score += 200
+// matchingInstitution returns the first institution that matches the
+// requested affiliation by containment or strong word overlap.
+func matchingInstitution(requested string, institutions []string) string {
+	want := NormalizeTitle(requested)
+	if want == "" {
+		return ""
 	}
-
-	targetTokens := strings.Fields(target)
-	candidateTokens := strings.Fields(candidate)
-	if len(targetTokens) == 0 || len(candidateTokens) == 0 {
-		return score
-	}
-
-	candidateSet := make(map[string]struct{}, len(candidateTokens))
-	for _, token := range candidateTokens {
-		candidateSet[token] = struct{}{}
-	}
-
-	overlap := 0
-	for _, token := range targetTokens {
-		if _, ok := candidateSet[token]; ok {
-			overlap++
+	for _, inst := range institutions {
+		have := NormalizeTitle(inst)
+		if have == "" {
+			continue
+		}
+		if strings.Contains(" "+have+" ", " "+want+" ") || strings.Contains(" "+want+" ", " "+have+" ") || TitleSimilarity(want, have) >= 0.75 {
+			return inst
 		}
 	}
-	score += overlap * 40
+	return ""
+}
 
-	if targetTokens[0] == candidateTokens[0] {
-		score += 20
-	}
-	if targetTokens[len(targetTokens)-1] == candidateTokens[len(candidateTokens)-1] {
-		score += 20
-	}
-
-	if len(targetTokens) > len(candidateTokens) {
-		score -= (len(targetTokens) - len(candidateTokens)) * 5
+// knownPaperAuthors resolves a DOI or exact title to its OpenAlex authorship
+// list (short author ID → display name).
+func knownPaperAuthors(ctx context.Context, requester *Requester, paper string) (map[string]string, string, *ToolError) {
+	var work *OpenAlexWork
+	if doi, ok := NormalizeDOI(paper); ok {
+		body, status, err := requester.GetJSON(ctx, "https://api.openalex.org/works/https://doi.org/"+doi)
+		if err != nil {
+			return nil, "", requestError("openalex", err)
+		}
+		if status != http.StatusOK {
+			return nil, "", statusError("openalex", status)
+		}
+		var w OpenAlexWork
+		if err := json.Unmarshal(body, &w); err != nil {
+			return nil, "", &ToolError{Code: CodeParseFailed, Message: "openalex work parse failed"}
+		}
+		work = &w
 	} else {
-		score -= (len(candidateTokens) - len(targetTokens)) * 5
-	}
-
-	return score
-}
-
-type crossrefWorksResponse struct {
-	Message struct {
-		Items []struct {
-			DOI                 string   `json:"DOI"`
-			Title               []string `json:"title"`
-			IsReferencedByCount int      `json:"is-referenced-by-count"`
-			Issued              struct {
-				DateParts [][]int `json:"date-parts"`
-			} `json:"issued"`
-			Author []struct {
-				Given       string `json:"given"`
-				Family      string `json:"family"`
-				Affiliation []struct {
-					Name string `json:"name"`
-				} `json:"affiliation"`
-			} `json:"author"`
-		} `json:"items"`
-	} `json:"message"`
-}
-
-func getAuthorInfoFromCrossref(ctx context.Context, requester *Requester, authorName string) (*AuthorInfo, *ToolError) {
-	searchURL := "https://api.crossref.org/works?query.author=" + url.QueryEscape(authorName) + "&rows=5"
-	body, status, err := requester.Get(ctx, searchURL)
-	if err != nil {
-		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("crossref author search failed: %v", err)}
-	}
-	if status != http.StatusOK {
-		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("crossref author search failed with status %d", status)}
-	}
-
-	var resp crossrefWorksResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, &ToolError{Code: "parse_failed", Message: fmt.Sprintf("crossref parse failed: %v", err)}
-	}
-	if len(resp.Message.Items) == 0 {
-		return nil, &ToolError{Code: "no_results", Message: "crossref author not found"}
-	}
-
-	name := authorName
-	affiliation := "N/A"
-	citedBy := 0
-	externalIDs := map[string]string{}
-	publications := make([]Publication, 0, 5)
-
-	for _, item := range resp.Message.Items {
-		if item.IsReferencedByCount > citedBy {
-			citedBy = item.IsReferencedByCount
+		params := url.Values{}
+		params.Set("search", paper)
+		params.Set("per-page", "10")
+		body, status, err := requester.GetJSON(ctx, "https://api.openalex.org/works?"+params.Encode())
+		if err != nil {
+			return nil, "", requestError("openalex", err)
 		}
-		title := "N/A"
-		if len(item.Title) > 0 {
-			title = normalizeSpace(item.Title[0])
-			if title == "" {
-				title = "N/A"
+		if status != http.StatusOK {
+			return nil, "", statusError("openalex", status)
+		}
+		var resp openAlexWorksSearchResponse
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, "", &ToolError{Code: CodeParseFailed, Message: "openalex work search parse failed"}
+		}
+		// Every work whose title matches exactly contributes authors, so a
+		// preprint and its published version both count.
+		ids := map[string]string{}
+		title := ""
+		for _, w := range resp.Results {
+			if TitleSimilarity(paper, w.DisplayTitle()) < 0.9 {
+				continue
 			}
-		}
-		year := "N/A"
-		if len(item.Issued.DateParts) > 0 && len(item.Issued.DateParts[0]) > 0 {
-			year = strconv.Itoa(item.Issued.DateParts[0][0])
-		}
-		publications = append(publications, Publication{
-			Title:     title,
-			Year:      year,
-			Citations: item.IsReferencedByCount,
-		})
-
-		if len(item.Author) > 0 {
-			a := item.Author[0]
-			candidateName := normalizeSpace(strings.TrimSpace(a.Given + " " + a.Family))
-			if candidateName != "" {
-				name = candidateName
-			}
-			if len(a.Affiliation) > 0 {
-				aff := normalizeSpace(a.Affiliation[0].Name)
-				if aff != "" {
-					affiliation = aff
+			title = w.DisplayTitle()
+			for _, a := range w.Authorships {
+				if id, ok := NormalizeOpenAlexID(a.Author.ID); ok {
+					ids[id] = a.Author.DisplayName
 				}
 			}
 		}
+		if title == "" {
+			return nil, "", &ToolError{Code: CodeNoResults, Message: fmt.Sprintf("no OpenAlex work titled %q", paper)}
+		}
+		return ids, title, nil
+	}
+	ids := map[string]string{}
+	for _, a := range work.Authorships {
+		if id, ok := NormalizeOpenAlexID(a.Author.ID); ok {
+			ids[id] = a.Author.DisplayName
+		}
+	}
+	return ids, work.DisplayTitle(), nil
+}
 
-		if strings.TrimSpace(item.DOI) != "" {
-			externalIDs["doi"] = item.DOI
+func buildOpenAlexAuthor(ctx context.Context, requester *Requester, r openAlexAuthorResult) (*AuthorInfo, *ToolError) {
+	affiliation := "N/A"
+	if insts := r.institutions(); len(insts) > 0 {
+		affiliation = insts[0]
+	}
+
+	interests := make([]string, 0, 5)
+	for _, t := range r.Topics {
+		if len(interests) >= 5 {
+			break
+		}
+		if topic := normalizeSpace(t.DisplayName); topic != "" {
+			interests = append(interests, topic)
+		}
+	}
+	for _, c := range r.XConcepts {
+		if len(interests) >= 5 || len(r.Topics) > 0 {
+			break
+		}
+		if topic := normalizeSpace(c.DisplayName); topic != "" {
+			interests = append(interests, topic)
 		}
 	}
 
-	return &AuthorInfo{
-		Name:         name,
+	metrics := AuthorMetrics{
+		CitedByCount: r.CitedByCount,
+		WorksCount:   r.WorksCount,
+		Source:       "openalex",
+		Scope:        "author_profile",
+		Note:         "Totals reported by the OpenAlex author profile; OpenAlex may split or merge profiles.",
+	}
+	if r.SummaryStats != nil {
+		metrics.HIndex = r.SummaryStats.HIndex
+		metrics.I10Index = r.SummaryStats.I10Index
+	}
+
+	externalIDs := map[string]string{}
+	if id := r.shortID(); id != "" {
+		externalIDs["openalex"] = id
+	}
+	if id := r.orcid(); id != "" {
+		externalIDs["orcid"] = id
+	}
+
+	author := &AuthorInfo{
+		Name:         normalizeSpace(r.DisplayName),
 		Affiliation:  affiliation,
-		Interests:    []string{},
-		CitedBy:      citedBy,
-		Publications: publications,
-		Source:       "crossref",
+		Interests:    interests,
+		Metrics:      metrics,
+		Publications: []Publication{},
+		Source:       "openalex",
 		ExternalIDs:  externalIDs,
+	}
+
+	if id := r.shortID(); id != "" {
+		params := url.Values{}
+		params.Set("filter", "author.id:"+id)
+		params.Set("sort", "cited_by_count:desc")
+		params.Set("per-page", strconv.Itoa(authorSampleSize))
+		params.Set("select", "id,doi,display_name,publication_year,cited_by_count")
+		body, status, err := requester.GetJSON(ctx, "https://api.openalex.org/works?"+params.Encode())
+		switch {
+		case err != nil || status != http.StatusOK:
+			if ctxErr := ContextError(ctx.Err(), "author works lookup"); ctxErr != nil {
+				return nil, ctxErr
+			}
+			author.Warnings = append(author.Warnings, "publication sample unavailable from OpenAlex")
+		default:
+			var works openAlexWorksSearchResponse
+			if json.Unmarshal(body, &works) == nil {
+				for _, w := range works.Results {
+					author.Publications = append(author.Publications, publicationFromWork(w))
+				}
+			}
+		}
+		author.PublicationSample = &PublicationSample{
+			Scope:  "top_cited_works",
+			Source: "openalex",
+			Count:  len(author.Publications),
+			Note:   "The author's most-cited works; citations are per work, not author totals.",
+		}
+	}
+	return author, nil
+}
+
+func publicationFromWork(w OpenAlexWork) Publication {
+	year := "N/A"
+	if w.PublicationYear > 0 {
+		year = strconv.Itoa(w.PublicationYear)
+	}
+	title := w.DisplayTitle()
+	if title == "" {
+		title = "N/A"
+	}
+	doi, _ := NormalizeDOI(w.DOI)
+	return Publication{Title: title, Year: year, Citations: w.CitedByCount, DOI: doi}
+}
+
+// ---- ORCID ---------------------------------------------------------------
+
+func orcidRecord(ctx context.Context, requester *Requester, orcidID string) (*AuthorInfo, *ToolError) {
+	body, status, err := requester.GetJSON(ctx, "https://pub.orcid.org/v3.0/"+orcidID+"/person")
+	if err != nil {
+		return nil, requestError("orcid", err)
+	}
+	if status == http.StatusNotFound {
+		return nil, &ToolError{Code: CodeNoResults, Message: "ORCID iD not found: " + orcidID}
+	}
+	if status != http.StatusOK {
+		return nil, statusError("orcid", status)
+	}
+	var person struct {
+		Name *struct {
+			GivenNames *struct {
+				Value string `json:"value"`
+			} `json:"given-names"`
+			FamilyName *struct {
+				Value string `json:"value"`
+			} `json:"family-name"`
+			CreditName *struct {
+				Value string `json:"value"`
+			} `json:"credit-name"`
+		} `json:"name"`
+	}
+	if err := json.Unmarshal(body, &person); err != nil {
+		return nil, &ToolError{Code: CodeParseFailed, Message: fmt.Sprintf("orcid record parse failed: %v", err)}
+	}
+	name := ""
+	if person.Name != nil {
+		if person.Name.CreditName != nil {
+			name = person.Name.CreditName.Value
+		}
+		if name == "" {
+			parts := []string{}
+			if person.Name.GivenNames != nil {
+				parts = append(parts, person.Name.GivenNames.Value)
+			}
+			if person.Name.FamilyName != nil {
+				parts = append(parts, person.Name.FamilyName.Value)
+			}
+			name = strings.Join(parts, " ")
+		}
+	}
+	return &AuthorInfo{
+		Name:        normalizeSpace(name),
+		Affiliation: "N/A",
+		Metrics:     unknownMetrics("orcid", "ORCID records do not include citation metrics."),
+		Source:      "orcid",
+		ExternalIDs: map[string]string{"orcid": orcidID},
 	}, nil
 }
 
-func getAuthorInfoFromORCID(ctx context.Context, requester *Requester, authorName string) (*AuthorInfo, *ToolError) {
-	q := fmt.Sprintf("given-and-family-names:(\"%s\")", authorName)
-	fields := "orcid,given-and-family-names,current-institution-affiliation-name"
-	searchURL := "https://pub.orcid.org/v3.0/csv-search/?q=" + url.QueryEscape(q) + "&fl=" + url.QueryEscape(fields)
+func unknownMetrics(source, note string) AuthorMetrics {
+	return AuthorMetrics{Source: source, Scope: "unavailable", Note: note}
+}
+
+func getAuthorInfoFromORCID(ctx context.Context, requester *Requester, q AuthorQuery) (*AuthorInfo, *ToolError) {
+	name := ParsePersonName(q.Name)
+	var query string
+	if len(name.Given) > 0 {
+		query = fmt.Sprintf("family-name:(%s) AND given-names:(%s)", orcidQuote(name.Family), orcidQuote(strings.Join(name.Given, " ")))
+	} else {
+		query = fmt.Sprintf("family-name:(%s)", orcidQuote(name.Family))
+	}
+	fields := "orcid,given-names,family-name,current-institution-affiliation-name"
+	searchURL := "https://pub.orcid.org/v3.0/csv-search/?q=" + url.QueryEscape(query) + "&fl=" + url.QueryEscape(fields) + "&rows=20"
 	body, status, err := requester.Get(ctx, searchURL)
 	if err != nil {
-		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("orcid author search failed: %v", err)}
+		return nil, requestError("orcid", err)
 	}
 	if status != http.StatusOK {
-		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("orcid author search failed with status %d", status)}
+		return nil, statusError("orcid", status)
 	}
 
-	reader := csv.NewReader(bytes.NewReader(body))
-	records, err := reader.ReadAll()
+	records, err := csv.NewReader(bytes.NewReader(body)).ReadAll()
 	if err != nil {
-		return nil, &ToolError{Code: "parse_failed", Message: fmt.Sprintf("orcid csv parse failed: %v", err)}
+		return nil, &ToolError{Code: CodeParseFailed, Message: fmt.Sprintf("orcid csv parse failed: %v", err)}
 	}
 	if len(records) < 2 {
-		return nil, &ToolError{Code: "no_results", Message: "orcid author not found"}
+		return nil, &ToolError{Code: CodeNoResults, Message: "orcid author not found"}
 	}
-
-	header := records[0]
-	row := records[1]
 	idx := map[string]int{}
-	for i, h := range header {
+	for i, h := range records[0] {
 		idx[strings.ToLower(strings.TrimSpace(h))] = i
 	}
-
-	get := func(key string) string {
+	get := func(row []string, key string) string {
 		i, ok := idx[key]
 		if !ok || i >= len(row) {
 			return ""
@@ -473,122 +790,316 @@ func getAuthorInfoFromORCID(ctx context.Context, requester *Requester, authorNam
 		return normalizeSpace(row[i])
 	}
 
-	orcidID := get("orcid")
-	name := get("given-and-family-names")
-	if name == "" {
-		name = authorName
+	type orcidHit struct {
+		id, name, aff string
+		affMatch      bool
 	}
-	affiliation := get("current-institution-affiliation-name")
+	hits := []orcidHit{}
+	for _, row := range records[1:] {
+		full := normalizeSpace(get(row, "given-names") + " " + get(row, "family-name"))
+		id, ok := NormalizeORCID(get(row, "orcid"))
+		if !ok || CompareNames(q.Name, full) == NameMismatch {
+			continue
+		}
+		h := orcidHit{id: id, name: full, aff: get(row, "current-institution-affiliation-name")}
+		if q.Affiliation != "" && matchingInstitution(q.Affiliation, strings.Split(h.aff, ",")) != "" {
+			h.affMatch = true
+		}
+		hits = append(hits, h)
+	}
+	if len(hits) == 0 {
+		return nil, &ToolError{Code: CodeNoResults, Message: "orcid author not found"}
+	}
+
+	var chosen *orcidHit
+	method, confidence := "name_unique", confidenceLow
+	affHits := []orcidHit{}
+	for _, h := range hits {
+		if h.affMatch {
+			affHits = append(affHits, h)
+		}
+	}
+	switch {
+	case len(affHits) == 1:
+		chosen, method, confidence = &affHits[0], "name+affiliation", confidenceMedium
+	case len(hits) == 1 && q.Affiliation == "":
+		chosen = &hits[0]
+	}
+	if chosen == nil {
+		cands := []Candidate{}
+		for _, h := range hits {
+			if len(cands) >= maxAuthorCandidates {
+				break
+			}
+			cands = append(cands, Candidate{ID: "orcid:" + h.id, Label: h.name, ORCID: h.id, Affiliation: h.aff, Source: "orcid"})
+		}
+		return nil, &ToolError{
+			Code:       CodeAmbiguous,
+			Message:    fmt.Sprintf("%d ORCID records match %q and the supplied evidence does not single one out", len(hits), q.Name),
+			Hint:       "Call again with orcid from a candidate.",
+			Candidates: cands,
+		}
+	}
+
+	affiliation := chosen.aff
 	if affiliation == "" {
 		affiliation = "N/A"
 	}
-
-	externalIDs := map[string]string{}
-	if orcidID != "" {
-		externalIDs["orcid"] = orcidID
+	evidence := []string{"name matches ORCID record"}
+	if chosen.affMatch {
+		evidence = append(evidence, "current affiliation matches")
 	}
-
 	return &AuthorInfo{
-		Name:         name,
-		Affiliation:  affiliation,
-		Interests:    []string{},
-		CitedBy:      0,
-		Publications: []Publication{},
-		Source:       "orcid",
-		ExternalIDs:  externalIDs,
+		Name:        chosen.name,
+		Affiliation: affiliation,
+		Metrics:     unknownMetrics("orcid", "ORCID records do not include citation metrics."),
+		Source:      "orcid",
+		ExternalIDs: map[string]string{"orcid": chosen.id},
+		Match:       &MatchInfo{Method: method, Confidence: confidence, Evidence: evidence},
 	}, nil
 }
 
-func getAuthorInfoFromScholar(ctx context.Context, requester *Requester, authorName string) (*AuthorInfo, *ToolError) {
-	searchURL := "https://scholar.google.com/citations?view_op=search_authors&mauthors=" + url.QueryEscape(strings.TrimSpace(authorName))
+// orcidQuote escapes a value for the ORCID (Solr) query syntax.
+func orcidQuote(v string) string {
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(v) + `"`
+}
+
+// ---- Crossref ------------------------------------------------------------
+
+// getAuthorInfoFromCrossref is a last resort. Crossref has no author
+// profiles, so the result is a sample of works whose author list contains a
+// matching name; they may belong to different people, and no author-level
+// metrics are reported.
+func getAuthorInfoFromCrossref(ctx context.Context, requester *Requester, q AuthorQuery) (*AuthorInfo, *ToolError) {
+	searchURL := "https://api.crossref.org/works?query.author=" + url.QueryEscape(q.Name) + "&rows=20&select=DOI,title,author,issued,is-referenced-by-count"
+	body, status, err := requester.GetJSON(ctx, searchURL)
+	if err != nil {
+		return nil, requestError("crossref", err)
+	}
+	if status != http.StatusOK {
+		return nil, statusError("crossref", status)
+	}
+	var resp crossrefWorksResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, &ToolError{Code: CodeParseFailed, Message: fmt.Sprintf("crossref parse failed: %v", err)}
+	}
+
+	publications := []Publication{}
+	affiliations := map[string]int{}
+	orcids := map[string]bool{}
+	for _, item := range resp.Message.Items {
+		var match *crossrefAuthor
+		for i := range item.Author {
+			if CompareNames(q.Name, item.Author[i].FullName()) != NameMismatch {
+				match = &item.Author[i]
+				break
+			}
+		}
+		if match == nil {
+			continue
+		}
+		if id, ok := NormalizeORCID(match.ORCID); ok {
+			orcids[id] = true
+		}
+		for _, aff := range match.Affiliation {
+			if a := normalizeSpace(aff.Name); a != "" {
+				affiliations[a]++
+			}
+		}
+		if len(publications) >= authorSampleSize {
+			continue
+		}
+		title := item.title()
+		if title == "" {
+			title = "N/A"
+		}
+		year := "N/A"
+		if y := item.year(); y > 0 {
+			year = strconv.Itoa(y)
+		}
+		doi, _ := NormalizeDOI(item.DOI)
+		publications = append(publications, Publication{Title: title, Year: year, Citations: item.IsReferencedByCount, DOI: doi})
+	}
+	if len(publications) == 0 {
+		return nil, &ToolError{Code: CodeNoResults, Message: "crossref has no works with a matching author name"}
+	}
+
+	warnings := []string{"Crossref has no author profiles: these works were matched by name only and may belong to different people with the same name."}
+	if len(orcids) > 1 {
+		warnings = append(warnings, fmt.Sprintf("the matched works carry %d different ORCID iDs, so at least %d different people share this name", len(orcids), len(orcids)))
+	}
+	affiliation := "N/A"
+	if len(affiliations) == 1 {
+		for a := range affiliations {
+			affiliation = a
+		}
+	}
+	externalIDs := map[string]string{}
+	if len(orcids) == 1 {
+		for id := range orcids {
+			externalIDs["orcid"] = id
+		}
+	}
+	return &AuthorInfo{
+		Name:         q.Name,
+		Affiliation:  affiliation,
+		Metrics:      unknownMetrics("crossref", "Crossref does not provide author-level metrics; per-work citation counts are not summed."),
+		Publications: publications,
+		PublicationSample: &PublicationSample{
+			Scope:  "name_matched_works_unverified",
+			Source: "crossref",
+			Count:  len(publications),
+			Note:   "Works whose author list contains a matching name; citations are per work (is-referenced-by-count).",
+		},
+		Source:      "crossref",
+		ExternalIDs: externalIDs,
+		Match:       &MatchInfo{Method: "name_only_works", Confidence: confidenceLow, Evidence: []string{"author name appears on matched works"}},
+		Warnings:    warnings,
+	}, nil
+}
+
+// ---- Google Scholar ------------------------------------------------------
+
+type scholarProfileHit struct {
+	author     AuthorInfo
+	profileURL string
+	userID     string
+}
+
+func getAuthorInfoFromScholar(ctx context.Context, requester *Requester, q AuthorQuery) (*AuthorInfo, *ToolError) {
+	searchURL := "https://scholar.google.com/citations?view_op=search_authors&mauthors=" + url.QueryEscape(q.Name)
 	body, status, err := requester.Get(ctx, searchURL)
 	if err != nil {
-		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("author search failed: %v", err)}
+		return nil, requestError("google scholar", err)
 	}
 	if status != http.StatusOK {
 		if status == http.StatusForbidden || status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
 			return nil, BuildBlockedError(status)
 		}
-		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("author search failed with status %d", status)}
+		return nil, &ToolError{Code: CodeUpstreamError, Message: fmt.Sprintf("author search failed with status %d", status)}
 	}
 
-	author, profileURL, parseErr := parseAuthorSearchResult(body)
+	hits, parseErr := parseAuthorSearchResults(body)
 	if parseErr != nil {
-		return nil, &ToolError{Code: "parse_failed", Message: parseErr.Error()}
+		return nil, &ToolError{Code: CodeParseFailed, Message: parseErr.Error()}
 	}
-	if author == nil {
+	if len(hits) == 0 {
 		if looksLikeBlocked(body) {
-			return nil, &ToolError{Code: "blocked", Message: "Google Scholar appears to have blocked this automated request"}
+			return nil, &ToolError{Code: CodeBlocked, Message: "Google Scholar appears to have blocked this automated request", Retryable: true}
 		}
-		return nil, &ToolError{Code: "no_results", Message: "author not found"}
+		return nil, &ToolError{Code: CodeNoResults, Message: "author not found"}
 	}
 
-	if profileURL == "" {
-		return author, nil
+	matches := []scholarProfileHit{}
+	for _, h := range hits {
+		if CompareNames(q.Name, h.author.Name) != NameMismatch {
+			matches = append(matches, h)
+		}
+	}
+	if q.Affiliation != "" {
+		affMatches := []scholarProfileHit{}
+		for _, h := range matches {
+			if matchingInstitution(q.Affiliation, []string{h.author.Affiliation}) != "" {
+				affMatches = append(affMatches, h)
+			}
+		}
+		if len(affMatches) > 0 {
+			matches = affMatches
+		}
+	}
+	if len(matches) == 0 {
+		return nil, &ToolError{Code: CodeNoResults, Message: "no Google Scholar profile matches the name"}
+	}
+	if len(matches) > 1 {
+		cands := []Candidate{}
+		for _, h := range matches {
+			if len(cands) >= maxAuthorCandidates {
+				break
+			}
+			cands = append(cands, Candidate{ID: "scholar:" + h.userID, Label: h.author.Name, Affiliation: h.author.Affiliation, CitedByCount: h.author.Metrics.CitedByCount, Source: "google_scholar"})
+		}
+		return nil, &ToolError{Code: CodeAmbiguous, Message: fmt.Sprintf("%d Google Scholar profiles match %q", len(matches), q.Name), Hint: "Add affiliation evidence or use an ORCID / OpenAlex ID.", Candidates: cands}
 	}
 
-	profileBody, profileStatus, profileErr := requester.Get(ctx, profileURL)
-	if profileErr != nil {
-		return author, nil
+	hit := matches[0]
+	author := hit.author
+	author.Source = "google_scholar"
+	author.ExternalIDs = map[string]string{}
+	if hit.userID != "" {
+		author.ExternalIDs["google_scholar"] = hit.userID
 	}
-	if profileStatus != http.StatusOK {
-		return author, nil
+	evidence := []string{"only name-compatible Google Scholar profile in search results"}
+	confidence := confidenceLow
+	if q.Affiliation != "" && matchingInstitution(q.Affiliation, []string{author.Affiliation}) != "" {
+		evidence = append(evidence, "affiliation matches")
+		confidence = confidenceMedium
 	}
+	author.Match = &MatchInfo{Method: "name_unique", Confidence: confidence, Evidence: evidence}
 
-	fillAuthorFromProfile(author, profileBody)
-	return author, nil
+	if hit.profileURL != "" {
+		if profileBody, profileStatus, profileErr := requester.Get(ctx, hit.profileURL); profileErr == nil && profileStatus == http.StatusOK {
+			fillAuthorFromProfile(&author, profileBody)
+		} else {
+			author.Warnings = append(author.Warnings, "Google Scholar profile page unavailable; publication sample omitted")
+		}
+	}
+	return &author, nil
 }
 
-func parseAuthorSearchResult(html []byte) (*AuthorInfo, string, error) {
+func parseAuthorSearchResults(html []byte) ([]scholarProfileHit, error) {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(html))
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-
-	first := doc.Find("div.gsc_1usr").First()
-	if first.Length() == 0 {
-		return nil, "", nil
-	}
-
-	name := normalizeSpace(first.Find("h3.gs_ai_name a").First().Text())
-	if name == "" {
-		name = "N/A"
-	}
-	affiliation := normalizeSpace(first.Find("div.gs_ai_aff").First().Text())
-	if affiliation == "" {
-		affiliation = "N/A"
-	}
-
-	interests := make([]string, 0)
-	first.Find("a.gs_ai_one_int").Each(func(_ int, sel *goquery.Selection) {
-		t := normalizeSpace(sel.Text())
-		if t != "" {
-			interests = append(interests, t)
+	hits := []scholarProfileHit{}
+	doc.Find("div.gsc_1usr").Each(func(_ int, sel *goquery.Selection) {
+		name := normalizeSpace(sel.Find("h3.gs_ai_name a").First().Text())
+		if name == "" {
+			return
 		}
+		affiliation := normalizeSpace(sel.Find("div.gs_ai_aff").First().Text())
+		if affiliation == "" {
+			affiliation = "N/A"
+		}
+		interests := []string{}
+		sel.Find("a.gs_ai_one_int").Each(func(_ int, s *goquery.Selection) {
+			if t := normalizeSpace(s.Text()); t != "" {
+				interests = append(interests, t)
+			}
+		})
+		var citedBy *int
+		citedText := normalizeSpace(sel.Find("div.gs_ai_cby").First().Text())
+		if idx := strings.LastIndex(citedText, " "); idx > -1 {
+			if v, err := strconv.Atoi(strings.TrimSpace(citedText[idx+1:])); err == nil {
+				citedBy = IntPtr(v)
+			}
+		}
+		href, _ := sel.Find("h3.gs_ai_name a").First().Attr("href")
+		profileURL, userID := "", ""
+		if strings.TrimSpace(href) != "" {
+			profileURL = "https://scholar.google.com" + href
+			if u, err := url.Parse(href); err == nil {
+				userID = u.Query().Get("user")
+			}
+		}
+		hits = append(hits, scholarProfileHit{
+			author: AuthorInfo{
+				Name:         name,
+				Affiliation:  affiliation,
+				Interests:    interests,
+				Publications: []Publication{},
+				Metrics: AuthorMetrics{
+					CitedByCount: citedBy,
+					Source:       "google_scholar",
+					Scope:        "author_profile",
+					Note:         "Total citations shown on the Google Scholar profile.",
+				},
+			},
+			profileURL: profileURL,
+			userID:     userID,
+		})
 	})
-
-	citedBy := 0
-	citedText := normalizeSpace(first.Find("div.gs_ai_cby").First().Text())
-	if idx := strings.LastIndex(citedText, " "); idx > -1 {
-		v, err := strconv.Atoi(strings.TrimSpace(citedText[idx+1:]))
-		if err == nil {
-			citedBy = v
-		}
-	}
-
-	href, _ := first.Find("h3.gs_ai_name a").First().Attr("href")
-	profileURL := ""
-	if strings.TrimSpace(href) != "" {
-		profileURL = "https://scholar.google.com" + href
-	}
-
-	return &AuthorInfo{
-		Name:         name,
-		Affiliation:  affiliation,
-		Interests:    interests,
-		CitedBy:      citedBy,
-		Publications: []Publication{},
-	}, profileURL, nil
+	return hits, nil
 }
 
 func fillAuthorFromProfile(author *AuthorInfo, html []byte) {
@@ -597,39 +1108,43 @@ func fillAuthorFromProfile(author *AuthorInfo, html []byte) {
 		return
 	}
 
-	if author.Name == "N/A" {
-		profileName := normalizeSpace(doc.Find("#gsc_prf_in").First().Text())
-		if profileName != "" {
-			author.Name = profileName
-		}
-	}
-
 	if author.Affiliation == "N/A" {
-		aff := normalizeSpace(doc.Find(".gsc_prf_il").First().Text())
-		if aff != "" {
+		if aff := normalizeSpace(doc.Find(".gsc_prf_il").First().Text()); aff != "" {
 			author.Affiliation = aff
 		}
 	}
 
-	publications := make([]Publication, 0, 5)
+	// The citation stats table lists All / Since-year columns for citations,
+	// h-index and i10-index.
+	doc.Find("#gsc_rsb_st tbody tr").Each(func(_ int, row *goquery.Selection) {
+		label := strings.ToLower(normalizeSpace(row.Find("td").First().Text()))
+		value, err := strconv.Atoi(normalizeSpace(row.Find("td.gsc_rsb_std").First().Text()))
+		if err != nil {
+			return
+		}
+		switch {
+		case strings.HasPrefix(label, "citations"):
+			author.Metrics.CitedByCount = IntPtr(value)
+		case strings.HasPrefix(label, "h-index"):
+			author.Metrics.HIndex = IntPtr(value)
+		case strings.HasPrefix(label, "i10-index"):
+			author.Metrics.I10Index = IntPtr(value)
+		}
+	})
+
+	publications := make([]Publication, 0, authorSampleSize)
 	doc.Find("tr.gsc_a_tr").EachWithBreak(func(_ int, sel *goquery.Selection) bool {
-		if len(publications) >= 5 {
+		if len(publications) >= authorSampleSize {
 			return false
 		}
-
 		title := normalizeSpace(sel.Find("a.gsc_a_at").First().Text())
 		if title == "" {
 			title = "N/A"
 		}
-
-		citations := 0
-		citText := normalizeSpace(sel.Find("a.gsc_a_ac").First().Text())
-		if citText != "" {
-			if c, err := strconv.Atoi(citText); err == nil {
-				citations = c
-			}
+		var citations *int
+		if c, err := strconv.Atoi(normalizeSpace(sel.Find("a.gsc_a_ac").First().Text())); err == nil {
+			citations = IntPtr(c)
 		}
-
 		year := normalizeSpace(sel.Find("span.gsc_a_h").First().Text())
 		if year == "" {
 			year = normalizeSpace(sel.Find("span.gsc_a_y").First().Text())
@@ -637,13 +1152,14 @@ func fillAuthorFromProfile(author *AuthorInfo, html []byte) {
 		if year == "" {
 			year = "N/A"
 		}
-
-		publications = append(publications, Publication{
-			Title:     title,
-			Year:      year,
-			Citations: citations,
-		})
+		publications = append(publications, Publication{Title: title, Year: year, Citations: citations})
 		return true
 	})
 	author.Publications = publications
+	author.PublicationSample = &PublicationSample{
+		Scope:  "scholar_profile_first_page",
+		Source: "google_scholar",
+		Count:  len(publications),
+		Note:   "First rows of the Google Scholar profile (sorted by citations by default); citations are per work.",
+	}
 }
