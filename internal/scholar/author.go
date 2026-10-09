@@ -512,7 +512,7 @@ func dominantAuthor(pool []*scoredAuthor) (*scoredAuthor, []*scoredAuthor) {
 		if c == top {
 			continue
 		}
-		if *top.profile.CitedByCount < DominanceRatio**c.profile.CitedByCount || *top.profile.WorksCount < DominanceRatio**c.profile.WorksCount {
+		if !Dominates(*top.profile.CitedByCount, *c.profile.CitedByCount) || !Dominates(*top.profile.WorksCount, *c.profile.WorksCount) {
 			return nil, nil
 		}
 		others = append(others, c)
@@ -775,6 +775,9 @@ func publicationFromWork(w OpenAlexWork) Publication {
 // match evidence use the bare identifiers.
 func openAlexAuthorURL(id string) string { return "https://openalex.org/" + id }
 func orcidURL(id string) string          { return "https://orcid.org/" + id }
+func scholarProfileURL(userID string) string {
+	return "https://scholar.google.com/citations?user=" + url.QueryEscape(userID)
+}
 
 // ---- ORCID ---------------------------------------------------------------
 
@@ -1058,7 +1061,7 @@ func getAuthorInfoFromScholar(ctx context.Context, requester *Requester, q Autho
 	body, status := doc.Body, doc.Status
 	if status != http.StatusOK {
 		if status == http.StatusForbidden || status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
-			return nil, BuildBlockedError(status)
+			return nil, BuildBlockedError(doc)
 		}
 		return nil, &ToolError{Code: CodeUpstreamError, Message: fmt.Sprintf("author search failed with status %d", status)}
 	}
@@ -1110,7 +1113,7 @@ func getAuthorInfoFromScholar(ctx context.Context, requester *Requester, q Autho
 	author.Source = "google_scholar"
 	author.ExternalIDs = map[string]string{}
 	if hit.userID != "" {
-		author.ExternalIDs["google_scholar"] = hit.userID
+		author.ExternalIDs["google_scholar"] = scholarProfileURL(hit.userID)
 	}
 	evidence := []string{"only name-compatible Google Scholar profile in search results"}
 	confidence := confidenceLow

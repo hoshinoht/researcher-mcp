@@ -3,7 +3,9 @@ package scholar
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -230,6 +232,34 @@ func TestGetAuthorInfo_ORCIDSearchExternalIDsAreURLs(t *testing.T) {
 	}
 }
 
+func TestGetAuthorInfo_ScholarFallbackExternalIDIsURL(t *testing.T) {
+	requester := newTestRequester(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.URL.Host == "api.openalex.org":
+			return httpResponse(http.StatusOK, `{"results":[]}`), nil
+		case req.URL.Host == "pub.orcid.org":
+			return httpResponse(http.StatusOK, "orcid,given-names,family-name,current-institution-affiliation-name\n"), nil
+		case req.URL.Host == "scholar.google.com" && req.URL.Query().Get("view_op") == "search_authors":
+			return httpResponse(http.StatusOK, `<html><body><div class="gsc_1usr"><h3 class="gs_ai_name"><a href="/citations?hl=en&amp;user=abc123XYZ">Rare Name</a></h3><div class="gs_ai_aff">Example University</div></div></body></html>`), nil
+		case req.URL.Host == "scholar.google.com":
+			return httpResponse(http.StatusNotFound, ""), nil
+		}
+		t.Errorf("unexpected request %s", req.URL)
+		return httpResponse(http.StatusNotFound, ""), nil
+	}))
+	author, toolErr := GetAuthorInfo(context.Background(), requester, AuthorQuery{Name: "Rare Name"})
+	if toolErr != nil {
+		t.Fatalf("toolErr = %+v", toolErr)
+	}
+	raw, err := json.Marshal(author)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if author.Source != "google_scholar" || !strings.Contains(string(raw), `"external_ids":{"google_scholar":"https://scholar.google.com/citations?user=abc123XYZ"}`) {
+		t.Fatalf("source = %q, serialized = %s", author.Source, raw)
+	}
+}
+
 func authorSearchTransport(t *testing.T, authors string) roundTripperFunc {
 	return func(req *http.Request) (*http.Response, error) {
 		switch {
@@ -279,5 +309,39 @@ func TestGetAuthorInfo_ComparableProfilesStayAmbiguous(t *testing.T) {
 	_, toolErr := GetAuthorInfo(context.Background(), requester, AuthorQuery{Name: "John Smith"})
 	if toolErr == nil || toolErr.Code != CodeAmbiguous || len(toolErr.Candidates) != 3 {
 		t.Fatalf("toolErr = %+v, want ambiguous with all three profiles", toolErr)
+	}
+}
+
+// Totals near math.MaxInt must not overflow the dominance check and let one
+// of two tied profiles be selected.
+func TestGetAuthorInfo_MaxIntTiedProfilesStayAmbiguous(t *testing.T) {
+	maxCount := strconv.Itoa(math.MaxInt)
+	requester := newTestRequester(authorSearchTransport(t, `{"results":[
+	 {"id":"https://openalex.org/A1","display_name":"John Smith","works_count":`+maxCount+`,"cited_by_count":`+maxCount+`},
+	 {"id":"https://openalex.org/A2","display_name":"John Smith","works_count":`+maxCount+`,"cited_by_count":`+maxCount+`}]}`))
+	_, toolErr := GetAuthorInfo(context.Background(), requester, AuthorQuery{Name: "John Smith"})
+	if toolErr == nil || toolErr.Code != CodeAmbiguous || len(toolErr.Candidates) != 2 {
+		t.Fatalf("toolErr = %+v, want ambiguous with both profiles", toolErr)
+	}
+}
+
+// The 10x threshold is inclusive, holds against zero, and never overflows.
+func TestDominates(t *testing.T) {
+	for _, c := range []struct {
+		top, other int
+		want       bool
+	}{
+		{100, 10, true},
+		{99, 10, false},
+		{100, 11, false},
+		{5, 0, true},
+		{0, 0, true},
+		{math.MaxInt, math.MaxInt, false},
+		{math.MaxInt, math.MaxInt / DominanceRatio, true},
+		{math.MaxInt, math.MaxInt/DominanceRatio + 1, false},
+	} {
+		if got := Dominates(c.top, c.other); got != c.want {
+			t.Errorf("Dominates(%d, %d) = %v, want %v", c.top, c.other, got, c.want)
+		}
 	}
 }

@@ -126,7 +126,8 @@ type FetchedDoc struct {
 	FinalURL    string
 	Status      int
 	// RetryAfter is the server-requested wait when the final response was
-	// rate limited and the wait was too long to honour within the deadline.
+	// rate limited: a Scholar 429 (never retried), or a retryable status whose
+	// wait was too long to honour within the deadline.
 	RetryAfter time.Duration
 }
 
@@ -236,6 +237,11 @@ func (r *Requester) fetch(ctx context.Context, rawURL, accept string, maxBytes i
 		}
 
 		if !isRetryableStatus(class, resp.StatusCode) {
+			if resp.StatusCode == http.StatusTooManyRequests {
+				if retryAfter, ok := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); ok {
+					doc.RetryAfter = retryAfter
+				}
+			}
 			return doc, nil
 		}
 
@@ -499,11 +505,14 @@ func hostFromURL(rawURL string) string {
 	return strings.ToLower(u.Hostname())
 }
 
-func BuildBlockedError(status int) *ToolError {
+// BuildBlockedError converts a Google Scholar block response into a
+// structured error, passing on any Retry-After the response carried.
+func BuildBlockedError(doc *FetchedDoc) *ToolError {
 	return &ToolError{
-		Code:      "blocked",
-		Message:   fmt.Sprintf("Google Scholar request returned status %d", status),
-		Hint:      "Increase SCHOLAR_MIN_DELAY and SCHOLAR_MAX_DELAY, reduce request volume, or configure SCHOLAR_PROXY_LIST.",
-		Retryable: true,
+		Code:              "blocked",
+		Message:           fmt.Sprintf("Google Scholar request returned status %d", doc.Status),
+		Hint:              "Increase SCHOLAR_MIN_DELAY and SCHOLAR_MAX_DELAY, reduce request volume, or configure SCHOLAR_PROXY_LIST.",
+		Retryable:         true,
+		RetryAfterSeconds: retryAfterSeconds(doc),
 	}
 }

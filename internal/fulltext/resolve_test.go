@@ -3,9 +3,11 @@ package fulltext
 import (
 	"context"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -444,6 +446,19 @@ func TestResolveTitleComparablePapersStayAmbiguous(t *testing.T) {
 	fetcher := titleSearchFetcher([]byte(`{"results":[
 	 {"id":"https://openalex.org/W1","display_name":"Graph Methods","publication_year":2010,"cited_by_count":900,"authorships":[{"author":{"display_name":"Ann Lee"}}]},
 	 {"id":"https://openalex.org/W2","display_name":"Graph Methods","publication_year":2019,"cited_by_count":200,"authorships":[{"author":{"display_name":"Bo Chen"}}]}]}`))
+	_, toolErr := resolve(context.Background(), fetcher, "", Request{Title: "Graph Methods"})
+	if toolErr == nil || toolErr.Code != scholar.CodeAmbiguous || len(toolErr.Candidates) != 2 {
+		t.Fatalf("toolErr = %+v, want ambiguous with both papers", toolErr)
+	}
+}
+
+// Citation counts near math.MaxInt must not overflow the dominance check
+// and let one of two tied papers be selected.
+func TestResolveTitleMaxIntTiedPapersStayAmbiguous(t *testing.T) {
+	maxCites := strconv.Itoa(math.MaxInt)
+	fetcher := titleSearchFetcher([]byte(`{"results":[
+	 {"id":"https://openalex.org/W1","display_name":"Graph Methods","publication_year":2010,"cited_by_count":` + maxCites + `,"authorships":[{"author":{"display_name":"Ann Lee"}}]},
+	 {"id":"https://openalex.org/W2","display_name":"Graph Methods","publication_year":2019,"cited_by_count":` + maxCites + `,"authorships":[{"author":{"display_name":"Bo Chen"}}]}]}`))
 	_, toolErr := resolve(context.Background(), fetcher, "", Request{Title: "Graph Methods"})
 	if toolErr == nil || toolErr.Code != scholar.CodeAmbiguous || len(toolErr.Candidates) != 2 {
 		t.Fatalf("toolErr = %+v, want ambiguous with both papers", toolErr)

@@ -67,6 +67,14 @@ type MatchInfo struct {
 // candidate's before it is selected without identifying evidence.
 const DominanceRatio = 10
 
+// Dominates reports whether count top is at least DominanceRatio times count
+// other. It compares against top/DominanceRatio rather than multiplying other,
+// which would overflow for counts near math.MaxInt and let a tie dominate.
+// Integer division floors for non-negative top, so the boundary is inclusive.
+func Dominates(top, other int) bool {
+	return top >= 0 && other <= top/DominanceRatio
+}
+
 type AuthorInfo struct {
 	Name        string   `json:"name"`
 	Affiliation string   `json:"affiliation"`

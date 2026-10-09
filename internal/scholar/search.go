@@ -129,7 +129,7 @@ func searchScholar(ctx context.Context, requester *Requester, searchURL string, 
 
 	if status != http.StatusOK {
 		if status == http.StatusForbidden || status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
-			return nil, BuildBlockedError(status)
+			return nil, BuildBlockedError(doc)
 		}
 		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("request failed with status %d", status)}
 	}
@@ -174,15 +174,17 @@ func requestError(provider string, err error) *ToolError {
 func statusError(provider string, doc *FetchedDoc) *ToolError {
 	switch status := doc.Status; status {
 	case http.StatusTooManyRequests:
-		e := &ToolError{Code: CodeBlocked, Message: fmt.Sprintf("%s rate limited the request (status 429)", provider), Hint: "Configure provider credentials (see README) or retry later.", Retryable: true}
-		if doc.RetryAfter > 0 {
-			e.RetryAfterSeconds = int(doc.RetryAfter.Seconds() + 0.5)
-		}
-		return e
+		return &ToolError{Code: CodeBlocked, Message: fmt.Sprintf("%s rate limited the request (status 429)", provider), Hint: "Configure provider credentials (see README) or retry later.", Retryable: true, RetryAfterSeconds: retryAfterSeconds(doc)}
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return &ToolError{Code: CodeUpstreamError, Message: fmt.Sprintf("%s rejected the request (status %d)", provider, status), Hint: "Check the provider credential configured for this server."}
 	}
 	return &ToolError{Code: CodeUpstreamError, Message: fmt.Sprintf("%s request failed with status %d", provider, doc.Status), Retryable: doc.Status >= 500}
+}
+
+// retryAfterSeconds rounds the response's unhonoured Retry-After to whole
+// seconds; zero (omitted from JSON) when there was none.
+func retryAfterSeconds(doc *FetchedDoc) int {
+	return int(doc.RetryAfter.Seconds() + 0.5)
 }
 
 type openAlexWorksSearchResponse struct {

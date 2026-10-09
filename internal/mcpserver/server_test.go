@@ -219,6 +219,30 @@ func TestRateLimitErrorsCarryRetryAfter(t *testing.T) {
 	}
 }
 
+// Google Scholar rate limits are never retried, but the Retry-After they
+// carry must still reach the client.
+func TestScholarRateLimitCarriesRetryAfter(t *testing.T) {
+	cfg := testConfig()
+	cfg.SearchProviders = []string{config.ProviderScholar}
+	session := connect(t, cfg, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host != "scholar.google.com" {
+			t.Errorf("unexpected request to %s", req.URL)
+		}
+		resp := jsonResponse(http.StatusTooManyRequests, `<html></html>`)
+		resp.Header.Set("Content-Type", "text/html")
+		resp.Header.Set("Retry-After", "120")
+		return resp, nil
+	}))
+	res, out := call(t, session, "search_research_articles", map[string]any{"query": "graph methods"})
+	if !res.IsError {
+		t.Fatalf("IsError = false: %v", out)
+	}
+	errObj, _ := out["error"].(map[string]any)
+	if errObj["code"] != "blocked" || errObj["retry_after_seconds"] != float64(120) || errObj["retryable"] != true {
+		t.Fatalf("error = %v", errObj)
+	}
+}
+
 func TestPaperContentContract(t *testing.T) {
 	body := `<html><body><article><h1>T</h1>` +
 		strings.Repeat(`<h2>Introduction</h2><p>intro text that is long enough to count as content in tests.</p>`, 1) +

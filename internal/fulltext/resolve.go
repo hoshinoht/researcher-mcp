@@ -880,7 +880,7 @@ func dominantGroup(groups [][]*titleCandidate, minPositives int) (int, bool) {
 		return -1, false
 	}
 	for i, c := range cites {
-		if i != top && cites[top] < scholar.DominanceRatio*c {
+		if i != top && !scholar.Dominates(cites[top], c) {
 			return -1, false
 		}
 	}
