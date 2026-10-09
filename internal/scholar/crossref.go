@@ -80,15 +80,15 @@ func buildCrossrefSearchURL(req SearchRequest) string {
 }
 
 func searchCrossref(ctx context.Context, requester *Requester, req SearchRequest) ([]PaperResult, *ToolError) {
-	body, status, err := requester.Get(ctx, buildCrossrefSearchURL(req))
+	doc, err := requester.Get(ctx, buildCrossrefSearchURL(req))
 	if err != nil {
 		return nil, requestError("crossref", err)
 	}
-	if status != http.StatusOK {
-		return nil, statusError("crossref", status)
+	if doc.Status != http.StatusOK {
+		return nil, statusError("crossref", doc)
 	}
 	var resp crossrefWorksResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if err := json.Unmarshal(doc.Body, &resp); err != nil {
 		return nil, &ToolError{Code: CodeParseFailed, Message: fmt.Sprintf("crossref parse failed: %v", err)}
 	}
 

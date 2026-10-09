@@ -15,8 +15,11 @@ import (
 )
 
 // DocFetcher is the narrow slice of *scholar.Requester this package needs.
+// GetDocument is for HTML/PDF candidates (document size cap); GetJSON is for
+// metadata APIs (response size cap).
 type DocFetcher interface {
 	GetDocument(ctx context.Context, rawURL string) (*scholar.FetchedDoc, error)
+	GetJSON(ctx context.Context, rawURL string) (*scholar.FetchedDoc, error)
 }
 
 const (

@@ -27,9 +27,19 @@ func NormalizeTitle(title string) string {
 	return strings.Join(strings.Fields(b.String()), " ")
 }
 
+// StrongTitleSimilarity is the score at or above which two titles are taken
+// to name the same work.
+const StrongTitleSimilarity = 0.9
+
+// unseparatedExtensionCap bounds the score of a title that is the other plus
+// extra leading or trailing words without a subtitle delimiter, keeping it
+// below StrongTitleSimilarity however many words the titles share.
+const unseparatedExtensionCap = 0.85
+
 // TitleSimilarity scores two titles in [0,1]. 1 means the normalized titles
 // are identical; a title that is the other plus a subtitle scores 0.9; other
-// pairs get the Dice coefficient of their word multisets.
+// pairs get the Dice coefficient of their word multisets, capped below the
+// strong threshold when one title merely extends the other.
 func TitleSimilarity(a, b string) float64 {
 	na, nb := NormalizeTitle(a), NormalizeTitle(b)
 	if na == "" || nb == "" {
@@ -47,7 +57,7 @@ func TitleSimilarity(a, b string) float64 {
 	}
 	if len(strings.Fields(short)) >= 3 {
 		if head := subtitleDelimiter.Split(longRaw, 2)[0]; head != longRaw && NormalizeTitle(head) == short {
-			return 0.9
+			return StrongTitleSimilarity
 		}
 	}
 
@@ -63,7 +73,29 @@ func TitleSimilarity(a, b string) float64 {
 			overlap++
 		}
 	}
-	return 2 * float64(overlap) / float64(len(ta)+len(tb))
+	dice := 2 * float64(overlap) / float64(len(ta)+len(tb))
+	if dice > unseparatedExtensionCap && unseparatedExtension(short, longRaw) {
+		return unseparatedExtensionCap
+	}
+	return dice
+}
+
+// unseparatedExtension reports whether the normalized title short is the
+// leading or trailing word run of longRaw without a subtitle delimiter at
+// the boundary ("a b c d e" inside "a b c d e f").
+func unseparatedExtension(short, longRaw string) bool {
+	long := NormalizeTitle(longRaw)
+	prefix := strings.HasPrefix(long, short+" ")
+	suffix := strings.HasSuffix(long, " "+short)
+	if !prefix && !suffix {
+		return false
+	}
+	for _, loc := range subtitleDelimiter.FindAllStringIndex(longRaw, -1) {
+		if (prefix && NormalizeTitle(longRaw[:loc[0]]) == short) || (suffix && NormalizeTitle(longRaw[loc[1]:]) == short) {
+			return false
+		}
+	}
+	return true
 }
 
 // PersonName is a parsed personal name.

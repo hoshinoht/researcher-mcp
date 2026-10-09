@@ -144,7 +144,7 @@ func newServer(cfg config.Config, version string, requester *scholar.Requester) 
 	order := strings.Join(displayProviders(cfg.SearchProviders), " → ")
 	searchDesc := fmt.Sprintf("Search scholarly articles (providers in order: %s; each result reports its source) using keyword queries", order)
 	advancedDesc := fmt.Sprintf("Search scholarly articles (providers in order: %s; each result reports its source) with author/year filters", order)
-	authorDesc := "Get researcher metadata (OpenAlex, then ORCID, Google Scholar and Crossref fallbacks). Accepts exact orcid/openalex_id, plus optional affiliation/known_paper evidence; returns an 'ambiguous' error with candidates instead of guessing between same-name people"
+	authorDesc := "Get researcher metadata (OpenAlex, then ORCID, Google Scholar and Crossref fallbacks). Accepts exact orcid/openalex_id, plus optional affiliation/known_paper evidence; returns an 'ambiguous' error with candidates for comparable same-name people, and selects a profile without evidence only when it is 10x more cited and prolific than every other (with a warning listing them)"
 	paperDesc := "Fetch a paper's text as markdown by URL, DOI, arXiv ID, OpenAlex ID, or title (open-access sources; paginated via max_chars/offset). content_status says whether it is full text, partial, or abstract only"
 	healthDesc := "Report Researcher MCP process health and configured providers/extractors (no network calls)"
 

@@ -21,12 +21,12 @@ type PaperResult struct {
 	OpenAlexID string `json:"openalex_id,omitempty"`
 }
 
-// Publication is one work in an author's publication sample. Citations is
-// null when the provider did not report a count.
+// Publication is one work in an author's publication sample. Citations is 0
+// when the provider did not report a count.
 type Publication struct {
 	Title     string `json:"title"`
 	Year      string `json:"year"`
-	Citations *int   `json:"citations"`
+	Citations int    `json:"citations"`
 	DOI       string `json:"doi,omitempty"`
 }
 
@@ -53,19 +53,27 @@ type PublicationSample struct {
 }
 
 // MatchInfo explains how an identity (author or paper) was resolved.
+// Alternatives lists the other identities that fit when one was selected by
+// dominance rather than by identifying evidence.
 type MatchInfo struct {
-	Method     string   `json:"method"`
-	Confidence string   `json:"confidence"`
-	Evidence   []string `json:"evidence,omitempty"`
+	Method       string      `json:"method"`
+	Confidence   string      `json:"confidence"`
+	Evidence     []string    `json:"evidence,omitempty"`
+	Alternatives []Candidate `json:"alternatives,omitempty"`
 }
+
+// DominanceRatio is the multiple by which one same-title paper's citations
+// (or one same-name author's citations and works) must exceed every other
+// candidate's before it is selected without identifying evidence.
+const DominanceRatio = 10
 
 type AuthorInfo struct {
 	Name        string   `json:"name"`
 	Affiliation string   `json:"affiliation"`
 	Interests   []string `json:"interests"`
-	// CitedBy is the author-level total citation count from Metrics, or
-	// null when no author profile reported one. Kept for compatibility.
-	CitedBy           *int               `json:"citedby"`
+	// CitedBy is the author-level total citation count from Metrics; it is
+	// omitted when no author profile reported one.
+	CitedBy           *int               `json:"citedby,omitempty"`
 	Metrics           AuthorMetrics      `json:"metrics"`
 	Publications      []Publication      `json:"publications"`
 	PublicationSample *PublicationSample `json:"publication_sample,omitempty"`

@@ -69,7 +69,7 @@ func TestCredentialsAreScopedToTheirProvider(t *testing.T) {
 		"https://publisher.example.org/paper",
 		"http://api.openalex.org/works", // plain HTTP never carries credentials
 	} {
-		if _, _, err := requester.Get(ctx, u); err != nil {
+		if _, err := requester.Get(ctx, u); err != nil {
 			t.Fatalf("Get(%s): %v", u, err)
 		}
 	}
@@ -117,7 +117,7 @@ func TestCredentialsDoNotFollowCrossHostRedirects(t *testing.T) {
 		}
 		return httpResponse(http.StatusOK, "ok"), nil
 	}))
-	if _, _, err := requester.Get(context.Background(), "https://api.crossref.org/works"); err != nil {
+	if _, err := requester.Get(context.Background(), "https://api.crossref.org/works"); err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 	if len(rec.reqs) != 2 {
@@ -136,7 +136,7 @@ func TestTransportErrorsAreRedacted(t *testing.T) {
 	requester := NewRequesterWithTransport(credentialConfig(), roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		return nil, errors.New("dial failed for " + req.URL.String())
 	}))
-	_, _, err := requester.Get(context.Background(), "https://api.unpaywall.org/v2/10.1/x?email=me@example.org")
+	_, err := requester.Get(context.Background(), "https://api.unpaywall.org/v2/10.1/x?email=me@example.org")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -144,7 +144,7 @@ func TestTransportErrorsAreRedacted(t *testing.T) {
 		t.Fatalf("error leaks contact or credential: %v", err)
 	}
 
-	_, _, err = requester.Get(context.Background(), "https://api.openalex.org/works")
+	_, err = requester.Get(context.Background(), "https://api.openalex.org/works")
 	if err == nil || strings.Contains(err.Error(), "oa-secret-key") {
 		t.Fatalf("openalex error leaks api key: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestGetEnforcesResponseSizeLimit(t *testing.T) {
 	requester := NewRequesterWithTransport(cfg, roundTripperFunc(func(*http.Request) (*http.Response, error) {
 		return httpResponse(http.StatusOK, strings.Repeat("x", 4096)), nil
 	}))
-	_, _, err := requester.Get(context.Background(), "https://api.openalex.org/works")
+	_, err := requester.Get(context.Background(), "https://api.openalex.org/works")
 	if !errors.Is(err, ErrBodyTooLarge) {
 		t.Fatalf("err = %v, want ErrBodyTooLarge", err)
 	}
@@ -184,9 +184,9 @@ func TestRetryAfterIsHonouredOrFailsFast(t *testing.T) {
 	}))
 	requester.cfg.MaxRetries = 2
 	start := time.Now()
-	_, status, err := requester.Get(context.Background(), "https://api.crossref.org/works")
-	if err != nil || status != http.StatusOK {
-		t.Fatalf("Get = %d, %v", status, err)
+	doc, err := requester.Get(context.Background(), "https://api.crossref.org/works")
+	if err != nil || doc.Status != http.StatusOK {
+		t.Fatalf("Get = %+v, %v", doc, err)
 	}
 	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
 		t.Fatalf("retried after %v, want >= Retry-After 1s", elapsed)
@@ -202,7 +202,7 @@ func TestRetryAfterIsHonouredOrFailsFast(t *testing.T) {
 	}))
 	requester.cfg.MaxRetries = 3
 	start = time.Now()
-	doc, err := requester.GetDocument(context.Background(), "https://api.crossref.org/works")
+	doc, err = requester.GetDocument(context.Background(), "https://api.crossref.org/works")
 	if err != nil || doc.Status != http.StatusTooManyRequests || doc.RetryAfter != 600*time.Second {
 		t.Fatalf("doc = %+v err = %v", doc, err)
 	}
@@ -222,9 +222,9 @@ func TestRetryStopsAtDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, status, err := requester.Get(ctx, "https://api.openalex.org/works")
-	if err != nil || status != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d err = %v", status, err)
+	doc, err := requester.Get(ctx, "https://api.openalex.org/works")
+	if err != nil || doc.Status != http.StatusServiceUnavailable {
+		t.Fatalf("doc = %+v err = %v", doc, err)
 	}
 	if calls != 1 || time.Since(start) > 250*time.Millisecond {
 		t.Fatalf("calls = %d elapsed = %v; backoff should not be attempted past the deadline", calls, time.Since(start))

@@ -121,10 +121,11 @@ func searchScholar(ctx context.Context, requester *Requester, searchURL string, 
 		return nil, &ToolError{Code: "invalid_input", Message: "search URL is empty"}
 	}
 
-	body, status, err := requester.Get(ctx, searchURL)
+	doc, err := requester.Get(ctx, searchURL)
 	if err != nil {
 		return nil, requestError("google scholar", err)
 	}
+	body, status := doc.Body, doc.Status
 
 	if status != http.StatusOK {
 		if status == http.StatusForbidden || status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
@@ -168,15 +169,20 @@ func requestError(provider string, err error) *ToolError {
 	return &ToolError{Code: CodeUpstreamError, Message: fmt.Sprintf("%s request failed: %s", provider, RedactText(err.Error())), Retryable: true}
 }
 
-// statusError converts a non-200 API status into a structured error.
-func statusError(provider string, status int) *ToolError {
-	switch status {
+// statusError converts a non-200 API response into a structured error,
+// passing on any Retry-After wait the requester could not honour.
+func statusError(provider string, doc *FetchedDoc) *ToolError {
+	switch status := doc.Status; status {
 	case http.StatusTooManyRequests:
-		return &ToolError{Code: CodeBlocked, Message: fmt.Sprintf("%s rate limited the request (status 429)", provider), Hint: "Configure provider credentials (see README) or retry later.", Retryable: true}
+		e := &ToolError{Code: CodeBlocked, Message: fmt.Sprintf("%s rate limited the request (status 429)", provider), Hint: "Configure provider credentials (see README) or retry later.", Retryable: true}
+		if doc.RetryAfter > 0 {
+			e.RetryAfterSeconds = int(doc.RetryAfter.Seconds() + 0.5)
+		}
+		return e
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return &ToolError{Code: CodeUpstreamError, Message: fmt.Sprintf("%s rejected the request (status %d)", provider, status), Hint: "Check the provider credential configured for this server."}
 	}
-	return &ToolError{Code: CodeUpstreamError, Message: fmt.Sprintf("%s request failed with status %d", provider, status), Retryable: status >= 500}
+	return &ToolError{Code: CodeUpstreamError, Message: fmt.Sprintf("%s request failed with status %d", provider, doc.Status), Retryable: doc.Status >= 500}
 }
 
 type openAlexWorksSearchResponse struct {
@@ -185,13 +191,14 @@ type openAlexWorksSearchResponse struct {
 
 func searchOpenAlex(ctx context.Context, requester *Requester, query, author string, yearRange []int, numResults int) ([]PaperResult, *ToolError) {
 	searchURL := buildOpenAlexSearchURL(query, author, yearRange, numResults)
-	body, status, err := requester.Get(ctx, searchURL)
+	doc, err := requester.Get(ctx, searchURL)
 	if err != nil {
 		return nil, requestError("openalex", err)
 	}
-	if status != http.StatusOK {
-		return nil, statusError("openalex", status)
+	if doc.Status != http.StatusOK {
+		return nil, statusError("openalex", doc)
 	}
+	body := doc.Body
 
 	var resp openAlexWorksSearchResponse
 	if err := json.Unmarshal(body, &resp); err != nil {

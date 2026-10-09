@@ -135,22 +135,15 @@ type FetchedDoc struct {
 // API and HTML responses).
 var ErrBodyTooLarge = errors.New("response body exceeds the configured size limit")
 
-// Get fetches an API or HTML response, bounded by MaxResponseBytes.
-func (r *Requester) Get(ctx context.Context, rawURL string) ([]byte, int, error) {
-	doc, err := r.fetch(ctx, rawURL, "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8", r.maxResponseBytes())
-	if err != nil {
-		return nil, 0, err
-	}
-	return doc.Body, doc.Status, nil
+// Get fetches an API or HTML response, bounded by MaxResponseBytes. The
+// returned document carries RetryAfter so rate-limit errors can report it.
+func (r *Requester) Get(ctx context.Context, rawURL string) (*FetchedDoc, error) {
+	return r.fetch(ctx, rawURL, "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8", r.maxResponseBytes())
 }
 
-// GetJSON fetches a JSON API response, bounded by MaxResponseBytes.
-func (r *Requester) GetJSON(ctx context.Context, rawURL string) ([]byte, int, error) {
-	doc, err := r.fetch(ctx, rawURL, "application/json", r.maxResponseBytes())
-	if err != nil {
-		return nil, 0, err
-	}
-	return doc.Body, doc.Status, nil
+// GetJSON fetches a JSON metadata API response, bounded by MaxResponseBytes.
+func (r *Requester) GetJSON(ctx context.Context, rawURL string) (*FetchedDoc, error) {
+	return r.fetch(ctx, rawURL, "application/json", r.maxResponseBytes())
 }
 
 // GetDocument fetches a document (PDF or HTML), bounded by MaxFetchBytes,

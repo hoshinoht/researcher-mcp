@@ -8,7 +8,7 @@ This project evolved from a Google Scholar-focused port into a provider-first Re
 
 - Configurable article search across OpenAlex, Crossref and Google Scholar. Every result reports its `source`, and each response reports the `provider` that answered (plus `attempts` when earlier providers failed).
 - A query made only of two or more double-quoted titles separated by whitespace (for example, `"Title One" "Title Two"`) is searched as an OpenAlex title batch when OpenAlex is enabled; Boolean operators and mixed text remain ordinary queries.
-- Researcher lookup that prefers exact identifiers (ORCID, OpenAlex author ID) and returns an `ambiguous` error with candidates instead of guessing between same-name people.
+- Researcher lookup that prefers exact identifiers (ORCID, OpenAlex author ID) and returns an `ambiguous` error with candidates instead of guessing between comparable same-name people.
 - Paper full text with explicit identity resolution, content classification (`full_text`, `unverified`, `partial`, `abstract_only`, `landing_page`), independent fallbacks and page/section provenance.
 - Structured errors with explicit codes, also flagged as MCP tool errors (`isError: true`).
 - Bounded networking: response size limits, per-provider pacing, Retry-After handling, retries only for transient failures, and a per-call deadline.
@@ -28,9 +28,9 @@ Every tool exists under a legacy name and a preferred alias (see [Tool catalog](
 	- Output: as above
 - `get_author_info` / `get_researcher_info`
 	- Input: `author_name` (one person; "Surname, Given" is accepted), or exact `orcid` / `openalex_id`; optional evidence `affiliation` and `known_paper` (DOI or exact title)
-	- Output: `author` object or `error`
+	- Output: `author` object or `error`. For compatibility, `publications` keeps its earlier shape, `external_ids` holds URLs (`https://openalex.org/A...`, `https://orcid.org/...`), and `citedby` is omitted when no author profile reports a total (see `metrics`).
 	- Exact identifiers are looked up directly; a supplied ORCID that disagrees with the OpenAlex profile is an `identifier_conflict`.
-	- Name lookups resolve only when evidence singles out one OpenAlex profile (a known paper's authorship, a matching affiliation, or a single name-compatible profile). Otherwise the error is `ambiguous` with `candidates` (ID, ORCID, affiliation, counts). Candidate order is not identity evidence; citation counts are never used to choose.
+	- Name lookups resolve when evidence singles out one OpenAlex profile (a known paper's authorship, a matching affiliation, or a single name-compatible profile). Without such evidence, a profile is selected only if its citations and works are each at least 10x every other matching profile's (and it has at least 20 works); `match.confidence` is then `medium`, `match.alternatives` lists the other profiles, and `warnings` names them. Otherwise the error is `ambiguous` with `candidates` (ID, ORCID, affiliation, counts). Candidate order is not identity evidence.
 	- Fallbacks when OpenAlex has no match or fails: ORCID, then Google Scholar, then Crossref.
 	- `match` explains the method, confidence (`high`/`medium`/`low`) and evidence; `warnings` lists caveats.
 - `get_paper_fulltext` / `read_research_paper`
@@ -41,7 +41,7 @@ Every tool exists under a legacy name and a preferred alias (see [Tool catalog](
 
 ## Full-text behaviour
 
-**Identity.** Exact identifiers win over titles. A title is matched against up to 10 OpenAlex candidates by normalized title, with optional author and year evidence. Records with the same title and overlapping authors are treated as versions of one paper (their locations are all tried). Different papers sharing a title, or no sufficiently close title, produce an `ambiguous` error with candidates; supplied identifiers that disagree (DOI vs arXiv ID, DOI vs title, URL vs DOI) produce `identifier_conflict`. If OpenAlex is unavailable, Crossref is used to identify the DOI. `content.identity` returns the resolved DOI / OpenAlex / arXiv / PMCID identifiers and the match evidence.
+**Identity.** Exact identifiers win over titles. A title is matched against up to 10 OpenAlex candidates by normalized title, with optional author and year evidence. A title that only adds words to another without a subtitle separator is not a strong match. Records with the same title and overlapping authors are treated as versions of one paper (their locations are all tried); records without authors are never merged. When different papers share a title and author/year evidence does not separate them, the paper whose citation count (after merging versions) is at least 10x every other's and at least 50 is selected with `match.confidence` `medium`, the others in `match.alternatives`, and a warning; otherwise the result is an `ambiguous` error with candidates. Citation counts never override identifying evidence. Supplied identifiers that disagree (DOI vs arXiv ID, DOI vs title, URL vs DOI) produce `identifier_conflict`. If OpenAlex is unavailable, Crossref is used to identify the DOI. `content.identity` returns the resolved DOI / OpenAlex / arXiv / PMCID identifiers and the match evidence.
 
 **Sources.** Candidates are de-duplicated and tried by priority: direct URL, arXiv (HTML, ar5iv, PDF), PubMed Central, open-access PDFs (published > accepted > submitted versions), open-access landing pages, then the DOI landing page. Unpaywall (requires `SCHOLAR_CONTACT_EMAIL`) is consulted independently once only landing pages remain or every candidate has failed, including when OpenAlex itself is down. Full-text pointers on pages (`citation_pdf_url`, `bepress_citation_pdf_url`, `eprints.document_url`, `link rel="alternate" type="application/pdf"`, `citation_fulltext_html_url`) are followed whenever a page is not already full text, however long it is. At most 8 documents are downloaded per call.
 

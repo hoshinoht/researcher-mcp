@@ -65,6 +65,24 @@ func TestTitleSimilarity(t *testing.T) {
 	}
 }
 
+// A title that is another plus one word, with no subtitle delimiter, names a
+// different paper; Dice alone (10/11 = 0.909) would call it a strong match.
+func TestTitleSimilarityCapsUnseparatedExtensions(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"Neural Networks For Image Classification", "Neural Networks For Image Classification Revisited"},
+		{"Neural Networks For Image Classification", "Recurrent Neural Networks For Image Classification"},
+		{"a b c d e", "a b c d e f"},
+	} {
+		if s := TitleSimilarity(pair[0], pair[1]); s >= StrongTitleSimilarity {
+			t.Errorf("TitleSimilarity(%q, %q) = %v, want < %v", pair[0], pair[1], s, StrongTitleSimilarity)
+		}
+	}
+	// An explicit delimiter keeps the subtitle and title-prefix forms strong.
+	if s := TitleSimilarity("Pre-training of Deep Bidirectional Transformers for Language Understanding", "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding"); s < StrongTitleSimilarity {
+		t.Errorf("delimited prefix similarity = %v, want >= %v", s, StrongTitleSimilarity)
+	}
+}
+
 func TestNormalizeIdentifiers(t *testing.T) {
 	if id, ok := NormalizeORCID("https://orcid.org/0000-0002-1825-0097"); !ok || id != "0000-0002-1825-0097" {
 		t.Fatalf("NormalizeORCID valid = %q %v", id, ok)

@@ -229,12 +229,12 @@ func TestRequester_RetriesBlockedStatusForOtherHosts(t *testing.T) {
 	requester.cfg.MaxRetries = 2
 	requester.cfg.BackoffFactor = 0
 
-	body, status, err := requester.Get(context.Background(), "https://api.openalex.org/works")
+	doc, err := requester.Get(context.Background(), "https://api.openalex.org/works")
 	if err != nil {
 		t.Fatalf("Get returned error: %v", err)
 	}
-	if status != http.StatusOK || string(body) != "ok" {
-		t.Fatalf("Get = (%q, %d), want (ok, 200)", body, status)
+	if doc.Status != http.StatusOK || string(doc.Body) != "ok" {
+		t.Fatalf("Get = (%q, %d), want (ok, 200)", doc.Body, doc.Status)
 	}
 	if requests != 2 {
 		t.Fatalf("requests = %d, want 2", requests)

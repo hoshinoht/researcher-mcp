@@ -1,0 +1,10 @@
+{"results":[
+ {"id":"https://openalex.org/W2949650786","display_name":"Deep Residual Learning for Image Recognition","publication_year":2015,"doi":"https://doi.org/10.48550/arxiv.1512.03385","cited_by_count":60000,
+  "authorships":[{"author":{"display_name":"Kaiming He"}},{"author":{"display_name":"Xiangyu Zhang"}}],
+  "locations":[{"is_oa":true,"landing_page_url":"https://arxiv.org/abs/1512.03385","pdf_url":"https://arxiv.org/pdf/1512.03385"}]},
+ {"id":"https://openalex.org/W4400000003","display_name":"Deep Residual Learning for Image Recognition","publication_year":2023,"doi":"https://doi.org/10.9999/other.resnet","cited_by_count":12,
+  "authorships":[{"author":{"display_name":"Somchai Prasert"}}],
+  "best_oa_location":{"is_oa":true,"pdf_url":"https://other.example.org/resnet.pdf"}},
+ {"id":"https://openalex.org/W2194775991","display_name":"Deep Residual Learning for Image Recognition","publication_year":2016,"doi":"https://doi.org/10.1109/cvpr.2016.90","cited_by_count":200000,
+  "authorships":[{"author":{"display_name":"Kaiming He"}},{"author":{"display_name":"Jian Sun"}}]}
+]}

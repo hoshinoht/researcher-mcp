@@ -173,11 +173,13 @@ func TestSearchReportsProvider(t *testing.T) {
 	}
 }
 
+// Two comparably established profiles: neither dominates the other, so the
+// name alone cannot pick one.
 func TestAmbiguousAuthorIsAnErrorWithCandidates(t *testing.T) {
 	session := connect(t, testConfig(), roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		return jsonResponse(http.StatusOK, `{"results":[
 		  {"id":"https://openalex.org/A1","display_name":"Wei Wang","works_count":900,"cited_by_count":50000},
-		  {"id":"https://openalex.org/A2","display_name":"Wei Wang","works_count":40,"cited_by_count":800}]}`), nil
+		  {"id":"https://openalex.org/A2","display_name":"Wei Wang","works_count":600,"cited_by_count":30000}]}`), nil
 	}))
 	res, out := call(t, session, "get_researcher_info", map[string]any{"author_name": "Wei Wang"})
 	if !res.IsError {
@@ -186,6 +188,34 @@ func TestAmbiguousAuthorIsAnErrorWithCandidates(t *testing.T) {
 	errObj := out["error"].(map[string]any)
 	if errObj["code"] != "ambiguous" || len(errObj["candidates"].([]any)) != 2 {
 		t.Fatalf("error = %v", errObj)
+	}
+}
+
+// A rate limit whose Retry-After is too long to wait out reaches the client
+// as a structured error carrying the wait, for both search and author tools.
+// Each tool gets a fresh server: the first 429 defers the host, so a second
+// call on the same requester would fail on the deferral instead.
+func TestRateLimitErrorsCarryRetryAfter(t *testing.T) {
+	limited := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		resp := jsonResponse(http.StatusTooManyRequests, `{}`)
+		resp.Header.Set("Retry-After", "120")
+		return resp, nil
+	})
+	for _, c := range []struct {
+		tool string
+		args map[string]any
+	}{
+		{"search_research_articles", map[string]any{"query": "graph methods"}},
+		{"get_researcher_info", map[string]any{"author_name": "Wei Wang"}},
+	} {
+		res, out := call(t, connect(t, testConfig(), limited), c.tool, c.args)
+		if !res.IsError {
+			t.Fatalf("%s: IsError = false: %v", c.tool, out)
+		}
+		errObj, _ := out["error"].(map[string]any)
+		if errObj["code"] != "blocked" || errObj["retry_after_seconds"] != float64(120) || errObj["retryable"] != true {
+			t.Fatalf("%s: error = %v", c.tool, errObj)
+		}
 	}
 }
 
@@ -227,8 +257,8 @@ func TestAuthorWithUnknownMetricsPassesOutputSchema(t *testing.T) {
 		t.Fatalf("unexpected error: %v", out)
 	}
 	author := out["author"].(map[string]any)
-	if v, ok := author["citedby"]; !ok || v != nil {
-		t.Fatalf("citedby = %v (present=%v), want explicit null", v, ok)
+	if v, ok := author["citedby"]; ok {
+		t.Fatalf("citedby = %v, want it omitted when unknown", v)
 	}
 	metrics := author["metrics"].(map[string]any)
 	if metrics["cited_by_count"] != nil || metrics["source"] != "openalex" {

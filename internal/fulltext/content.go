@@ -717,12 +717,6 @@ func (s *Service) cacheGet(key string) *extractedDoc {
 	return entry.doc
 }
 
-func (s *Service) cachePut(key string, doc *extractedDoc) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cachePutLocked(key, doc)
-}
-
 // cachePutLocked stores a document under LRU eviction bounded by entry
 // count and total bytes. Non-full-text results expire sooner so a transient
 // failure does not pin a partial result.

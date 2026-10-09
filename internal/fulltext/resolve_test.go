@@ -2,6 +2,8 @@ package fulltext
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"googlescholar-mcp-go/internal/config"
 	"googlescholar-mcp-go/internal/scholar"
 )
 
@@ -59,6 +62,12 @@ func (f *fakeFetcher) GetDocument(ctx context.Context, rawURL string) (*scholar.
 		return &out, nil
 	}
 	return &scholar.FetchedDoc{Status: 404, Body: []byte("not found"), FinalURL: rawURL}, nil
+}
+
+// GetJSON serves the same canned responses; the size-cap split between the
+// two methods is covered against a real Requester.
+func (f *fakeFetcher) GetJSON(ctx context.Context, rawURL string) (*scholar.FetchedDoc, error) {
+	return f.GetDocument(ctx, rawURL)
 }
 
 func (f *fakeFetcher) callsSnapshot() []string {
@@ -366,3 +375,117 @@ func TestResolveInvalidInputs(t *testing.T) {
 		}
 	}
 }
+
+func titleSearchFetcher(body []byte) *fakeFetcher {
+	return &fakeFetcher{responses: map[string]*scholar.FetchedDoc{
+		"api.openalex.org/works?": {Status: 200, Body: body},
+	}}
+}
+
+// Live OpenAlex lists the real "Attention Is All You Need" beside unrelated
+// records with the exact title; the paper cited 10x more than every other
+// same-title record is selected, with the others offered as alternatives.
+func TestResolveTitleSelectsDominantPaper(t *testing.T) {
+	fetcher := titleSearchFetcher(loadFixture(t, "openalex_title_attention_dominant.json"))
+	res, toolErr := resolve(context.Background(), fetcher, "", Request{Title: "Attention Is All You Need"})
+	if toolErr != nil {
+		t.Fatalf("resolve error: %+v", toolErr)
+	}
+	id := res.Identity
+	if id.OpenAlexID != "W2626778328" || id.ArxivID != "1706.03762" {
+		t.Fatalf("identity = %+v, want the dominant paper", id)
+	}
+	if id.Match.Confidence != "medium" || len(id.Match.Alternatives) != 2 {
+		t.Fatalf("match = %+v", id.Match)
+	}
+	for _, alt := range id.Match.Alternatives {
+		if alt.ID == "" || alt.Label == "" || alt.Year == 0 {
+			t.Fatalf("alternative lacks id/title/year: %+v", alt)
+		}
+	}
+	if len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "alternatives") {
+		t.Fatalf("warnings = %v", res.Warnings)
+	}
+	for _, u := range candidateURLs(res) {
+		if strings.Contains(u, "books.example.org") {
+			t.Fatalf("candidates include an alternative paper's location: %v", candidateURLs(res))
+		}
+	}
+}
+
+// The CVPR and arXiv records of ResNet are versions of one paper. Neither
+// record is 10x the other, so only after merging them does the paper dominate
+// an unrelated same-title paper. The most-cited version supplies the identity
+// and the arXiv version contributes its location.
+func TestResolveTitleDominanceMergesVersionsFirst(t *testing.T) {
+	fetcher := titleSearchFetcher(loadFixture(t, "openalex_title_resnet_versions.json"))
+	res, toolErr := resolve(context.Background(), fetcher, "", Request{Title: "Deep Residual Learning for Image Recognition"})
+	if toolErr != nil {
+		t.Fatalf("resolve error: %+v", toolErr)
+	}
+	if res.Identity.DOI != "10.1109/cvpr.2016.90" || res.Identity.OpenAlexID != "W2194775991" {
+		t.Fatalf("identity = %+v", res.Identity)
+	}
+	if urls := strings.Join(candidateURLs(res), " "); !strings.Contains(urls, "arxiv.org/pdf/1512.03385") || strings.Contains(urls, "other.example.org") {
+		t.Fatalf("candidates = %v, want the arXiv version and not the unrelated paper", candidateURLs(res))
+	}
+	if res.Identity.Match.Confidence != "medium" || len(res.Identity.Match.Alternatives) != 1 || res.Identity.Match.Alternatives[0].DOI != "10.9999/other.resnet" {
+		t.Fatalf("match = %+v", res.Identity.Match)
+	}
+
+	// Identifying evidence still wins outright, without a dominance warning.
+	res, toolErr = resolve(context.Background(), fetcher, "", Request{Title: "Deep Residual Learning for Image Recognition", Author: "Kaiming He", Year: 2016})
+	if toolErr != nil || res.Identity.Match.Confidence != "high" || len(res.Identity.Match.Alternatives) != 0 || len(res.Warnings) != 0 {
+		t.Fatalf("with evidence: %+v %+v", res, toolErr)
+	}
+}
+
+func TestResolveTitleComparablePapersStayAmbiguous(t *testing.T) {
+	fetcher := titleSearchFetcher([]byte(`{"results":[
+	 {"id":"https://openalex.org/W1","display_name":"Graph Methods","publication_year":2010,"cited_by_count":900,"authorships":[{"author":{"display_name":"Ann Lee"}}]},
+	 {"id":"https://openalex.org/W2","display_name":"Graph Methods","publication_year":2019,"cited_by_count":200,"authorships":[{"author":{"display_name":"Bo Chen"}}]}]}`))
+	_, toolErr := resolve(context.Background(), fetcher, "", Request{Title: "Graph Methods"})
+	if toolErr == nil || toolErr.Code != scholar.CodeAmbiguous || len(toolErr.Candidates) != 2 {
+		t.Fatalf("toolErr = %+v, want ambiguous with both papers", toolErr)
+	}
+}
+
+// A same-title record without authors has nothing tying it to the other
+// record, so the two must not be merged into one paper.
+func TestResolveTitleDoesNotMergeAuthorlessRecords(t *testing.T) {
+	fetcher := titleSearchFetcher([]byte(`{"results":[
+	 {"id":"https://openalex.org/W1","display_name":"Graph Methods","publication_year":2018,"authorships":[{"author":{"display_name":"Ann Lee"}}]},
+	 {"id":"https://openalex.org/W2","display_name":"Graph Methods","publication_year":2019,"authorships":[]}]}`))
+	_, toolErr := resolve(context.Background(), fetcher, "", Request{Title: "Graph Methods"})
+	if toolErr == nil || toolErr.Code != scholar.CodeAmbiguous {
+		t.Fatalf("toolErr = %+v, want ambiguous", toolErr)
+	}
+}
+
+// Metadata API responses are bounded by RESEARCHER_MAX_RESPONSE_MB, not the
+// much larger document cap meant for PDFs and HTML pages.
+func TestMetadataLookupUsesResponseSizeCap(t *testing.T) {
+	work := `{"id":"https://openalex.org/W30","display_name":"Robust Paper"}` + strings.Repeat(" ", 4096)
+	requester := scholar.NewRequesterWithTransport(config.Config{
+		MaxRetries:       1,
+		UserAgents:       []string{"test"},
+		MaxResponseBytes: 1024,
+		MaxFetchBytes:    1 << 20,
+	}, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(work)), Request: req}, nil
+	}))
+	res, toolErr := resolve(context.Background(), requester, "", Request{DOI: "10.1000/robust"})
+	if toolErr != nil {
+		t.Fatalf("resolve error: %+v", toolErr)
+	}
+	if len(res.Attempts) == 0 || res.Attempts[0].Outcome != scholar.CodeUpstreamError || !strings.Contains(res.Attempts[0].Message, "size limit") {
+		t.Fatalf("attempts = %+v, want the OpenAlex lookup rejected by the response size cap", res.Attempts)
+	}
+	if res.Identity.Title != "" {
+		t.Fatalf("identity title = %q; the oversized metadata must not be parsed", res.Identity.Title)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }

@@ -185,21 +185,21 @@ type openAlexAuthorResponse struct {
 }
 
 func fetchOpenAlexAuthor(ctx context.Context, requester *Requester, idPath string) (*openAlexAuthorResult, int, *ToolError) {
-	body, status, err := requester.GetJSON(ctx, "https://api.openalex.org/authors/"+idPath)
+	doc, err := requester.GetJSON(ctx, "https://api.openalex.org/authors/"+idPath)
 	if err != nil {
 		return nil, 0, requestError("openalex", err)
 	}
-	if status == http.StatusNotFound {
-		return nil, status, &ToolError{Code: CodeNoResults, Message: "openalex author not found"}
+	if doc.Status == http.StatusNotFound {
+		return nil, doc.Status, &ToolError{Code: CodeNoResults, Message: "openalex author not found"}
 	}
-	if status != http.StatusOK {
-		return nil, status, statusError("openalex", status)
+	if doc.Status != http.StatusOK {
+		return nil, doc.Status, statusError("openalex", doc)
 	}
 	var a openAlexAuthorResult
-	if err := json.Unmarshal(body, &a); err != nil {
-		return nil, status, &ToolError{Code: CodeParseFailed, Message: fmt.Sprintf("openalex author parse failed: %v", err)}
+	if err := json.Unmarshal(doc.Body, &a); err != nil {
+		return nil, doc.Status, &ToolError{Code: CodeParseFailed, Message: fmt.Sprintf("openalex author parse failed: %v", err)}
 	}
-	return &a, status, nil
+	return &a, doc.Status, nil
 }
 
 func resolveAuthorByIdentifier(ctx context.Context, requester *Requester, q AuthorQuery) (*AuthorInfo, *ToolError) {
@@ -336,15 +336,15 @@ func resolveOpenAlexAuthorByName(ctx context.Context, requester *Requester, q Au
 	params := url.Values{}
 	params.Set("search", q.Name)
 	params.Set("per-page", "25")
-	body, status, err := requester.GetJSON(ctx, "https://api.openalex.org/authors?"+params.Encode())
+	doc, err := requester.GetJSON(ctx, "https://api.openalex.org/authors?"+params.Encode())
 	if err != nil {
 		return nil, requestError("openalex", err)
 	}
-	if status != http.StatusOK {
-		return nil, statusError("openalex", status)
+	if doc.Status != http.StatusOK {
+		return nil, statusError("openalex", doc)
 	}
 	var resp openAlexAuthorResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if err := json.Unmarshal(doc.Body, &resp); err != nil {
 		return nil, &ToolError{Code: CodeParseFailed, Message: fmt.Sprintf("openalex author parse failed: %v", err)}
 	}
 
@@ -446,24 +446,100 @@ func resolveOpenAlexAuthorByName(ctx context.Context, requester *Requester, q Au
 		}
 	}
 
+	var alternatives []Candidate
 	if chosen == nil {
-		pool := candidates
+		pool, poolMethod := candidates, "name"
 		switch {
 		case len(paperMatches) > 1:
-			pool = paperMatches
+			pool, poolMethod = paperMatches, "name+known_paper"
 		case len(affMatches) > 1:
-			pool = affMatches
+			pool, poolMethod = affMatches, "name+affiliation"
 		}
-		return nil, ambiguousAuthors(q, pool, notes)
+		top, others := dominantAuthor(pool)
+		if top == nil {
+			return nil, ambiguousAuthors(q, pool, notes)
+		}
+		chosen, method, confidence = top, poolMethod+"+dominance", confidenceMedium
+		chosen.evidence = append(chosen.evidence, fmt.Sprintf("cited by %d with %d works: at least %dx every other matching profile on both", *top.profile.CitedByCount, *top.profile.WorksCount, DominanceRatio))
+		if poolMethod == "name" && (q.Affiliation != "" || q.KnownPaper != "") {
+			notes = append(notes, "the supplied affiliation / known_paper evidence did not confirm this profile")
+			confidence = confidenceLow
+		}
+		alternatives = make([]Candidate, 0, len(others))
+		for _, o := range others {
+			if len(alternatives) >= maxAuthorCandidates {
+				break
+			}
+			alternatives = append(alternatives, authorCandidate(o.profile, o.evidence))
+		}
+		notes = append(notes, dominanceWarning(q.Name, top, alternatives, len(others)))
 	}
 
 	author, toolErr := buildOpenAlexAuthor(ctx, requester, chosen.profile)
 	if toolErr != nil {
 		return nil, toolErr
 	}
-	author.Match = &MatchInfo{Method: method, Confidence: confidence, Evidence: chosen.evidence}
+	author.Match = &MatchInfo{Method: method, Confidence: confidence, Evidence: chosen.evidence, Alternatives: alternatives}
 	author.Warnings = append(author.Warnings, notes...)
 	return author, nil
+}
+
+// minDominantAuthorWorks keeps the dominance tie-break from choosing between
+// sparse profiles, where the counts say little about who is meant.
+const minDominantAuthorWorks = 20
+
+// dominantAuthor returns the profile whose citation and works totals are each
+// at least DominanceRatio times every other profile's in pool (with at least
+// minDominantAuthorWorks works), plus the others ordered by works count. It
+// returns nil when no profile dominates or any total is unknown: a stray
+// same-name profile is then told apart from the real one, while comparable
+// same-name researchers stay ambiguous.
+func dominantAuthor(pool []*scoredAuthor) (*scoredAuthor, []*scoredAuthor) {
+	var top *scoredAuthor
+	for _, c := range pool {
+		if c.profile.CitedByCount == nil || c.profile.WorksCount == nil {
+			return nil, nil
+		}
+		if top == nil || *c.profile.CitedByCount > *top.profile.CitedByCount {
+			top = c
+		}
+	}
+	if top == nil || *top.profile.WorksCount < minDominantAuthorWorks {
+		return nil, nil
+	}
+	others := make([]*scoredAuthor, 0, len(pool)-1)
+	for _, c := range pool {
+		if c == top {
+			continue
+		}
+		if *top.profile.CitedByCount < DominanceRatio**c.profile.CitedByCount || *top.profile.WorksCount < DominanceRatio**c.profile.WorksCount {
+			return nil, nil
+		}
+		others = append(others, c)
+	}
+	sort.SliceStable(others, func(i, j int) bool {
+		return *others[i].profile.WorksCount > *others[j].profile.WorksCount
+	})
+	return top, others
+}
+
+// dominanceWarning tells the caller that other profiles share the name and
+// how to pick one of them instead.
+func dominanceWarning(name string, top *scoredAuthor, alternatives []Candidate, total int) string {
+	descs := make([]string, 0, len(alternatives))
+	for _, a := range alternatives {
+		parts := []string{}
+		if a.ORCID != "" {
+			parts = append(parts, "ORCID "+a.ORCID)
+		}
+		if a.Affiliation != "" {
+			parts = append(parts, a.Affiliation)
+		}
+		parts = append(parts, fmt.Sprintf("%d works, %d citations", derefInt(a.WorksCount), derefInt(a.CitedByCount)))
+		descs = append(descs, a.ID+" ("+strings.Join(parts, ", ")+")")
+	}
+	return fmt.Sprintf("%d other OpenAlex profile(s) also match %q: %s. Selected %s because its citations and works are each at least %dx theirs; call again with openalex_id or orcid to choose another (see match.alternatives).",
+		total, name, strings.Join(descs, "; "), top.profile.shortID(), DominanceRatio)
 }
 
 func ambiguousAuthors(q AuthorQuery, pool []*scoredAuthor, notes []string) *ToolError {
@@ -541,15 +617,15 @@ func matchingInstitution(requested string, institutions []string) string {
 func knownPaperAuthors(ctx context.Context, requester *Requester, paper string) (map[string]string, string, *ToolError) {
 	var work *OpenAlexWork
 	if doi, ok := NormalizeDOI(paper); ok {
-		body, status, err := requester.GetJSON(ctx, "https://api.openalex.org/works/https://doi.org/"+doi)
+		doc, err := requester.GetJSON(ctx, "https://api.openalex.org/works/https://doi.org/"+doi)
 		if err != nil {
 			return nil, "", requestError("openalex", err)
 		}
-		if status != http.StatusOK {
-			return nil, "", statusError("openalex", status)
+		if doc.Status != http.StatusOK {
+			return nil, "", statusError("openalex", doc)
 		}
 		var w OpenAlexWork
-		if err := json.Unmarshal(body, &w); err != nil {
+		if err := json.Unmarshal(doc.Body, &w); err != nil {
 			return nil, "", &ToolError{Code: CodeParseFailed, Message: "openalex work parse failed"}
 		}
 		work = &w
@@ -557,15 +633,15 @@ func knownPaperAuthors(ctx context.Context, requester *Requester, paper string) 
 		params := url.Values{}
 		params.Set("search", paper)
 		params.Set("per-page", "10")
-		body, status, err := requester.GetJSON(ctx, "https://api.openalex.org/works?"+params.Encode())
+		doc, err := requester.GetJSON(ctx, "https://api.openalex.org/works?"+params.Encode())
 		if err != nil {
 			return nil, "", requestError("openalex", err)
 		}
-		if status != http.StatusOK {
-			return nil, "", statusError("openalex", status)
+		if doc.Status != http.StatusOK {
+			return nil, "", statusError("openalex", doc)
 		}
 		var resp openAlexWorksSearchResponse
-		if err := json.Unmarshal(body, &resp); err != nil {
+		if err := json.Unmarshal(doc.Body, &resp); err != nil {
 			return nil, "", &ToolError{Code: CodeParseFailed, Message: "openalex work search parse failed"}
 		}
 		// Every work whose title matches exactly contributes authors, so a
@@ -573,7 +649,7 @@ func knownPaperAuthors(ctx context.Context, requester *Requester, paper string) 
 		ids := map[string]string{}
 		title := ""
 		for _, w := range resp.Results {
-			if TitleSimilarity(paper, w.DisplayTitle()) < 0.9 {
+			if TitleSimilarity(paper, w.DisplayTitle()) < StrongTitleSimilarity {
 				continue
 			}
 			title = w.DisplayTitle()
@@ -635,10 +711,10 @@ func buildOpenAlexAuthor(ctx context.Context, requester *Requester, r openAlexAu
 
 	externalIDs := map[string]string{}
 	if id := r.shortID(); id != "" {
-		externalIDs["openalex"] = id
+		externalIDs["openalex"] = openAlexAuthorURL(id)
 	}
 	if id := r.orcid(); id != "" {
-		externalIDs["orcid"] = id
+		externalIDs["orcid"] = orcidURL(id)
 	}
 
 	author := &AuthorInfo{
@@ -657,16 +733,16 @@ func buildOpenAlexAuthor(ctx context.Context, requester *Requester, r openAlexAu
 		params.Set("sort", "cited_by_count:desc")
 		params.Set("per-page", strconv.Itoa(authorSampleSize))
 		params.Set("select", "id,doi,display_name,publication_year,cited_by_count")
-		body, status, err := requester.GetJSON(ctx, "https://api.openalex.org/works?"+params.Encode())
+		doc, err := requester.GetJSON(ctx, "https://api.openalex.org/works?"+params.Encode())
 		switch {
-		case err != nil || status != http.StatusOK:
+		case err != nil || doc.Status != http.StatusOK:
 			if ctxErr := ContextError(ctx.Err(), "author works lookup"); ctxErr != nil {
 				return nil, ctxErr
 			}
 			author.Warnings = append(author.Warnings, "publication sample unavailable from OpenAlex")
 		default:
 			var works openAlexWorksSearchResponse
-			if json.Unmarshal(body, &works) == nil {
+			if json.Unmarshal(doc.Body, &works) == nil {
 				for _, w := range works.Results {
 					author.Publications = append(author.Publications, publicationFromWork(w))
 				}
@@ -692,22 +768,28 @@ func publicationFromWork(w OpenAlexWork) Publication {
 		title = "N/A"
 	}
 	doi, _ := NormalizeDOI(w.DOI)
-	return Publication{Title: title, Year: year, Citations: w.CitedByCount, DOI: doi}
+	return Publication{Title: title, Year: year, Citations: derefInt(w.CitedByCount), DOI: doi}
 }
+
+// external_ids keep the URL forms earlier releases returned; candidates and
+// match evidence use the bare identifiers.
+func openAlexAuthorURL(id string) string { return "https://openalex.org/" + id }
+func orcidURL(id string) string          { return "https://orcid.org/" + id }
 
 // ---- ORCID ---------------------------------------------------------------
 
 func orcidRecord(ctx context.Context, requester *Requester, orcidID string) (*AuthorInfo, *ToolError) {
-	body, status, err := requester.GetJSON(ctx, "https://pub.orcid.org/v3.0/"+orcidID+"/person")
+	doc, err := requester.GetJSON(ctx, "https://pub.orcid.org/v3.0/"+orcidID+"/person")
 	if err != nil {
 		return nil, requestError("orcid", err)
 	}
-	if status == http.StatusNotFound {
+	if doc.Status == http.StatusNotFound {
 		return nil, &ToolError{Code: CodeNoResults, Message: "ORCID iD not found: " + orcidID}
 	}
-	if status != http.StatusOK {
-		return nil, statusError("orcid", status)
+	if doc.Status != http.StatusOK {
+		return nil, statusError("orcid", doc)
 	}
+	body := doc.Body
 	var person struct {
 		Name *struct {
 			GivenNames *struct {
@@ -745,7 +827,7 @@ func orcidRecord(ctx context.Context, requester *Requester, orcidID string) (*Au
 		Affiliation: "N/A",
 		Metrics:     unknownMetrics("orcid", "ORCID records do not include citation metrics."),
 		Source:      "orcid",
-		ExternalIDs: map[string]string{"orcid": orcidID},
+		ExternalIDs: map[string]string{"orcid": orcidURL(orcidID)},
 	}, nil
 }
 
@@ -763,13 +845,14 @@ func getAuthorInfoFromORCID(ctx context.Context, requester *Requester, q AuthorQ
 	}
 	fields := "orcid,given-names,family-name,current-institution-affiliation-name"
 	searchURL := "https://pub.orcid.org/v3.0/csv-search/?q=" + url.QueryEscape(query) + "&fl=" + url.QueryEscape(fields) + "&rows=20"
-	body, status, err := requester.Get(ctx, searchURL)
+	doc, err := requester.Get(ctx, searchURL)
 	if err != nil {
 		return nil, requestError("orcid", err)
 	}
-	if status != http.StatusOK {
-		return nil, statusError("orcid", status)
+	if doc.Status != http.StatusOK {
+		return nil, statusError("orcid", doc)
 	}
+	body := doc.Body
 
 	records, err := csv.NewReader(bytes.NewReader(body)).ReadAll()
 	if err != nil {
@@ -854,7 +937,7 @@ func getAuthorInfoFromORCID(ctx context.Context, requester *Requester, q AuthorQ
 		Affiliation: affiliation,
 		Metrics:     unknownMetrics("orcid", "ORCID records do not include citation metrics."),
 		Source:      "orcid",
-		ExternalIDs: map[string]string{"orcid": chosen.id},
+		ExternalIDs: map[string]string{"orcid": orcidURL(chosen.id)},
 		Match:       &MatchInfo{Method: method, Confidence: confidence, Evidence: evidence},
 	}, nil
 }
@@ -872,15 +955,15 @@ func orcidQuote(v string) string {
 // metrics are reported.
 func getAuthorInfoFromCrossref(ctx context.Context, requester *Requester, q AuthorQuery) (*AuthorInfo, *ToolError) {
 	searchURL := "https://api.crossref.org/works?query.author=" + url.QueryEscape(q.Name) + "&rows=20&select=DOI,title,author,issued,is-referenced-by-count"
-	body, status, err := requester.GetJSON(ctx, searchURL)
+	doc, err := requester.GetJSON(ctx, searchURL)
 	if err != nil {
 		return nil, requestError("crossref", err)
 	}
-	if status != http.StatusOK {
-		return nil, statusError("crossref", status)
+	if doc.Status != http.StatusOK {
+		return nil, statusError("crossref", doc)
 	}
 	var resp crossrefWorksResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if err := json.Unmarshal(doc.Body, &resp); err != nil {
 		return nil, &ToolError{Code: CodeParseFailed, Message: fmt.Sprintf("crossref parse failed: %v", err)}
 	}
 
@@ -918,7 +1001,7 @@ func getAuthorInfoFromCrossref(ctx context.Context, requester *Requester, q Auth
 			year = strconv.Itoa(y)
 		}
 		doi, _ := NormalizeDOI(item.DOI)
-		publications = append(publications, Publication{Title: title, Year: year, Citations: item.IsReferencedByCount, DOI: doi})
+		publications = append(publications, Publication{Title: title, Year: year, Citations: derefInt(item.IsReferencedByCount), DOI: doi})
 	}
 	if len(publications) == 0 {
 		return nil, &ToolError{Code: CodeNoResults, Message: "crossref has no works with a matching author name"}
@@ -937,7 +1020,7 @@ func getAuthorInfoFromCrossref(ctx context.Context, requester *Requester, q Auth
 	externalIDs := map[string]string{}
 	if len(orcids) == 1 {
 		for id := range orcids {
-			externalIDs["orcid"] = id
+			externalIDs["orcid"] = orcidURL(id)
 		}
 	}
 	return &AuthorInfo{
@@ -968,10 +1051,11 @@ type scholarProfileHit struct {
 
 func getAuthorInfoFromScholar(ctx context.Context, requester *Requester, q AuthorQuery) (*AuthorInfo, *ToolError) {
 	searchURL := "https://scholar.google.com/citations?view_op=search_authors&mauthors=" + url.QueryEscape(q.Name)
-	body, status, err := requester.Get(ctx, searchURL)
+	doc, err := requester.Get(ctx, searchURL)
 	if err != nil {
 		return nil, requestError("google scholar", err)
 	}
+	body, status := doc.Body, doc.Status
 	if status != http.StatusOK {
 		if status == http.StatusForbidden || status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
 			return nil, BuildBlockedError(status)
@@ -1037,8 +1121,8 @@ func getAuthorInfoFromScholar(ctx context.Context, requester *Requester, q Autho
 	author.Match = &MatchInfo{Method: "name_unique", Confidence: confidence, Evidence: evidence}
 
 	if hit.profileURL != "" {
-		if profileBody, profileStatus, profileErr := requester.Get(ctx, hit.profileURL); profileErr == nil && profileStatus == http.StatusOK {
-			fillAuthorFromProfile(&author, profileBody)
+		if profile, profileErr := requester.Get(ctx, hit.profileURL); profileErr == nil && profile.Status == http.StatusOK {
+			fillAuthorFromProfile(&author, profile.Body)
 		} else {
 			author.Warnings = append(author.Warnings, "Google Scholar profile page unavailable; publication sample omitted")
 		}
@@ -1141,9 +1225,9 @@ func fillAuthorFromProfile(author *AuthorInfo, html []byte) {
 		if title == "" {
 			title = "N/A"
 		}
-		var citations *int
+		citations := 0
 		if c, err := strconv.Atoi(normalizeSpace(sel.Find("a.gsc_a_ac").First().Text())); err == nil {
-			citations = IntPtr(c)
+			citations = c
 		}
 		year := normalizeSpace(sel.Find("span.gsc_a_h").First().Text())
 		if year == "" {

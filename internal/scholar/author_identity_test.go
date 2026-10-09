@@ -8,13 +8,13 @@ import (
 	"testing"
 )
 
-// Two different people named Wei Wang; the more-cited one must not win by
-// citation count alone.
+// Two different, comparably established people named Wei Wang: neither
+// dominates the other, so name alone must stay ambiguous.
 const twoWeiWangs = `{"results":[
  {"id":"https://openalex.org/A1","orcid":"https://orcid.org/0000-0002-1825-0097","display_name":"Wei Wang","works_count":900,"cited_by_count":50000,
   "summary_stats":{"h_index":90,"i10_index":400},
   "last_known_institutions":[{"id":"https://openalex.org/I1","display_name":"University of California, Los Angeles"}]},
- {"id":"https://openalex.org/A2","display_name":"Wei Wang","works_count":40,"cited_by_count":800,
+ {"id":"https://openalex.org/A2","display_name":"Wei Wang","works_count":300,"cited_by_count":9000,
   "last_known_institutions":[{"id":"https://openalex.org/I2","display_name":"Tsinghua University"}]},
  {"id":"https://openalex.org/A3","display_name":"Wei Zhang","works_count":10,"cited_by_count":5}
 ]}`
@@ -61,8 +61,8 @@ func TestGetAuthorInfo_AffiliationEvidenceResolves(t *testing.T) {
 	if toolErr != nil {
 		t.Fatalf("toolErr = %+v", toolErr)
 	}
-	if author.ExternalIDs["openalex"] != "A2" {
-		t.Fatalf("resolved %v, want A2 (Tsinghua)", author.ExternalIDs)
+	if author.ExternalIDs["openalex"] != "https://openalex.org/A2" {
+		t.Fatalf("resolved %v, want A2 (Tsinghua) in URL form", author.ExternalIDs)
 	}
 	if author.Match == nil || author.Match.Method != "name+affiliation" {
 		t.Fatalf("match = %+v", author.Match)
@@ -80,7 +80,7 @@ func TestGetAuthorInfo_KnownPaperEvidenceResolves(t *testing.T) {
 	if toolErr != nil {
 		t.Fatalf("toolErr = %+v", toolErr)
 	}
-	if author.ExternalIDs["openalex"] != "A1" || author.Match.Confidence != "high" {
+	if author.ExternalIDs["openalex"] != "https://openalex.org/A1" || author.ExternalIDs["orcid"] != "https://orcid.org/0000-0002-1825-0097" || author.Match.Confidence != "high" {
 		t.Fatalf("author = %v match = %+v", author.ExternalIDs, author.Match)
 	}
 }
@@ -161,7 +161,7 @@ func TestGetAuthorInfo_OpenAlexMetricsAreAuthorLevel(t *testing.T) {
 	if author.PublicationSample == nil || author.PublicationSample.Scope != "top_cited_works" {
 		t.Fatalf("publication sample = %+v", author.PublicationSample)
 	}
-	if len(author.Publications) != 1 || author.Publications[0].Citations == nil || *author.Publications[0].Citations != 1234 {
+	if len(author.Publications) != 1 || author.Publications[0].Citations != 1234 {
 		t.Fatalf("publications = %+v", author.Publications)
 	}
 }
@@ -204,7 +204,80 @@ func TestGetAuthorInfo_CrossrefFallbackHasNoAuthorMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), `"citedby":null`) {
-		t.Fatalf("citedby should serialize as null: %s", raw)
+	if strings.Contains(string(raw), `"citedby"`) {
+		t.Fatalf("unknown citedby should be omitted: %s", raw)
+	}
+}
+
+// Every author path reports external_ids in the URL form main returned.
+func TestGetAuthorInfo_ORCIDSearchExternalIDsAreURLs(t *testing.T) {
+	requester := newTestRequester(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Host {
+		case "api.openalex.org":
+			return httpResponse(http.StatusOK, `{"results":[]}`), nil
+		case "pub.orcid.org":
+			return httpResponse(http.StatusOK, "orcid,given-names,family-name,current-institution-affiliation-name\n0000-0002-1825-0097,Rare,Name,Example University\n"), nil
+		}
+		t.Errorf("unexpected request %s", req.URL)
+		return httpResponse(http.StatusNotFound, ""), nil
+	}))
+	author, toolErr := GetAuthorInfo(context.Background(), requester, AuthorQuery{Name: "Rare Name"})
+	if toolErr != nil {
+		t.Fatalf("toolErr = %+v", toolErr)
+	}
+	if author.Source != "orcid" || author.ExternalIDs["orcid"] != "https://orcid.org/0000-0002-1825-0097" {
+		t.Fatalf("source = %q external_ids = %v", author.Source, author.ExternalIDs)
+	}
+}
+
+func authorSearchTransport(t *testing.T, authors string) roundTripperFunc {
+	return func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.URL.Host == "api.openalex.org" && req.URL.Path == "/authors":
+			return httpResponse(http.StatusOK, authors), nil
+		case req.URL.Host == "api.openalex.org" && req.URL.Path == "/works":
+			return httpResponse(http.StatusOK, `{"results":[]}`), nil
+		}
+		t.Errorf("unexpected request %s", req.URL)
+		return httpResponse(http.StatusNotFound, ""), nil
+	}
+}
+
+// Live OpenAlex has a stray exact-name "Yoshua Bengio" profile beside the
+// real one; a profile with 10x the citations and works of every other match
+// is selected, with the stray offered as an alternative.
+func TestGetAuthorInfo_DominantProfileIsSelected(t *testing.T) {
+	requester := newTestRequester(authorSearchTransport(t, `{"results":[
+	 {"id":"https://openalex.org/A5000000001","display_name":"Yoshua Bengio","works_count":5,"cited_by_count":0,
+	  "last_known_institutions":[{"display_name":"Example Hospital"}]},
+	 {"id":"https://openalex.org/A5086198262","orcid":"https://orcid.org/0000-0002-1825-0097","display_name":"Yoshua Bengio","works_count":1379,"cited_by_count":486966,
+	  "last_known_institutions":[{"display_name":"Université de Montréal"}]}]}`))
+	author, toolErr := GetAuthorInfo(context.Background(), requester, AuthorQuery{Name: "Yoshua Bengio"})
+	if toolErr != nil {
+		t.Fatalf("toolErr = %+v", toolErr)
+	}
+	if author.ExternalIDs["openalex"] != "https://openalex.org/A5086198262" {
+		t.Fatalf("resolved %v, want the dominant profile", author.ExternalIDs)
+	}
+	if author.Match.Method != "name+dominance" || author.Match.Confidence != "medium" {
+		t.Fatalf("match = %+v", author.Match)
+	}
+	if len(author.Match.Alternatives) != 1 || author.Match.Alternatives[0].ID != "A5000000001" || author.Match.Alternatives[0].Affiliation != "Example Hospital" {
+		t.Fatalf("alternatives = %+v", author.Match.Alternatives)
+	}
+	if len(author.Warnings) != 1 || !strings.Contains(author.Warnings[0], "A5000000001") {
+		t.Fatalf("warnings = %v", author.Warnings)
+	}
+}
+
+// Several established same-name researchers ("John Smith") stay ambiguous.
+func TestGetAuthorInfo_ComparableProfilesStayAmbiguous(t *testing.T) {
+	requester := newTestRequester(authorSearchTransport(t, `{"results":[
+	 {"id":"https://openalex.org/A1","display_name":"John Smith","works_count":900,"cited_by_count":20000},
+	 {"id":"https://openalex.org/A2","display_name":"John Smith","works_count":750,"cited_by_count":15000},
+	 {"id":"https://openalex.org/A3","display_name":"John Smith","works_count":600,"cited_by_count":1500}]}`))
+	_, toolErr := GetAuthorInfo(context.Background(), requester, AuthorQuery{Name: "John Smith"})
+	if toolErr == nil || toolErr.Code != CodeAmbiguous || len(toolErr.Candidates) != 3 {
+		t.Fatalf("toolErr = %+v, want ambiguous with all three profiles", toolErr)
 	}
 }

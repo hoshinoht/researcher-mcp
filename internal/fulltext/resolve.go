@@ -3,6 +3,7 @@ package fulltext
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -598,8 +599,10 @@ type titleCandidate struct {
 	Authors    []string
 	DOI        string
 	OpenAlexID string
-	Provider   string
-	work       *scholar.OpenAlexWork
+	// Cited is the record's citation count, when the provider reports one.
+	Cited    *int
+	Provider string
+	work     *scholar.OpenAlexWork
 
 	sim      float64
 	authorEv int // +1 match, -1 mismatch, 0 unknown
@@ -637,14 +640,15 @@ func (c *titleCandidate) evidence() []string {
 
 func (c *titleCandidate) toCandidate() scholar.Candidate {
 	return scholar.Candidate{
-		ID:       firstNonEmpty(c.OpenAlexID, prefixed("doi:", c.DOI)),
-		Label:    c.Title,
-		Year:     c.Year,
-		DOI:      c.DOI,
-		Authors:  strings.Join(firstN(c.Authors, 4), ", "),
-		Score:    float64(int(c.sim*100+0.5)) / 100,
-		Evidence: c.evidence(),
-		Source:   c.Provider,
+		ID:           firstNonEmpty(c.OpenAlexID, prefixed("doi:", c.DOI)),
+		Label:        c.Title,
+		Year:         c.Year,
+		DOI:          c.DOI,
+		Authors:      strings.Join(firstN(c.Authors, 4), ", "),
+		CitedByCount: c.Cited,
+		Score:        float64(int(c.sim*100+0.5)) / 100,
+		Evidence:     c.evidence(),
+		Source:       c.Provider,
 	}
 }
 
@@ -686,16 +690,14 @@ func scoreTitleCandidates(n *normalized, cands []*titleCandidate) {
 
 // sameWorkVersions reports whether two title hits are plausibly versions of
 // one paper (preprint and published record): near-identical titles,
-// overlapping author surnames and close years.
+// overlapping author surnames and close years. Hits without authors are never
+// merged, since nothing ties them to the same people.
 func sameWorkVersions(a, b *titleCandidate) bool {
-	if scholar.TitleSimilarity(a.Title, b.Title) < 0.9 {
+	if scholar.TitleSimilarity(a.Title, b.Title) < scholar.StrongTitleSimilarity {
 		return false
 	}
 	if a.Year != 0 && b.Year != 0 && abs(a.Year-b.Year) > 3 {
 		return false
-	}
-	if len(a.Authors) == 0 || len(b.Authors) == 0 {
-		return true
 	}
 	families := map[string]bool{}
 	for _, name := range a.Authors {
@@ -710,13 +712,14 @@ func sameWorkVersions(a, b *titleCandidate) bool {
 }
 
 // decideTitle picks the matching work, its versions, and the match
-// evidence, or explains why the title is ambiguous or unmatched.
-func decideTitle(n *normalized, cands []*titleCandidate) ([]*titleCandidate, scholar.MatchInfo, *scholar.ToolError) {
+// evidence, or explains why the title is ambiguous or unmatched. Warnings
+// are returned when a paper was selected by citation dominance.
+func decideTitle(n *normalized, cands []*titleCandidate) ([]*titleCandidate, scholar.MatchInfo, []string, *scholar.ToolError) {
 	scoreTitleCandidates(n, cands)
 
 	strong := []*titleCandidate{}
 	for _, c := range cands {
-		if c.sim >= 0.9 && !c.negative() {
+		if c.sim >= scholar.StrongTitleSimilarity && !c.negative() {
 			strong = append(strong, c)
 		}
 	}
@@ -741,7 +744,7 @@ func decideTitle(n *normalized, cands []*titleCandidate) ([]*titleCandidate, sch
 			}
 		}
 		if len(fuzzy) == 1 && fuzzy[0].positives() > 0 {
-			return fuzzy, scholar.MatchInfo{Method: "title_fuzzy", Confidence: "medium", Evidence: fuzzy[0].evidence()}, nil
+			return fuzzy, scholar.MatchInfo{Method: "title_fuzzy", Confidence: "medium", Evidence: fuzzy[0].evidence()}, nil, nil
 		}
 		near := []*titleCandidate{}
 		for _, c := range cands {
@@ -750,14 +753,14 @@ func decideTitle(n *normalized, cands []*titleCandidate) ([]*titleCandidate, sch
 			}
 		}
 		if len(near) > 0 {
-			return nil, scholar.MatchInfo{}, &scholar.ToolError{
+			return nil, scholar.MatchInfo{}, nil, &scholar.ToolError{
 				Code:       scholar.CodeAmbiguous,
 				Message:    fmt.Sprintf("no search result matches the title %q closely enough (with the supplied evidence) to identify the paper", n.title),
 				Hint:       evidenceHint,
 				Candidates: listed(near),
 			}
 		}
-		return nil, scholar.MatchInfo{}, &scholar.ToolError{
+		return nil, scholar.MatchInfo{}, nil, &scholar.ToolError{
 			Code:       scholar.CodeNoResults,
 			Message:    fmt.Sprintf("no paper found matching title %q", n.title),
 			Hint:       "Check the title, or use a DOI, arXiv ID, or direct URL instead.",
@@ -765,16 +768,10 @@ func decideTitle(n *normalized, cands []*titleCandidate) ([]*titleCandidate, sch
 		}
 	}
 
-	best := strong[0]
-	versions := []*titleCandidate{best}
-	others := []*titleCandidate{}
-	for _, c := range strong[1:] {
-		if sameWorkVersions(best, c) {
-			versions = append(versions, c)
-		} else {
-			others = append(others, c)
-		}
-	}
+	groups := versionGroups(strong)
+	best, versions := strong[0], groups[0]
+	others := flatten(groups[1:])
+	dominant := false
 	if len(others) > 0 {
 		separated := best.positives() > 0
 		for _, o := range others {
@@ -783,12 +780,19 @@ func decideTitle(n *normalized, cands []*titleCandidate) ([]*titleCandidate, sch
 			}
 		}
 		if !separated {
-			return nil, scholar.MatchInfo{}, &scholar.ToolError{
-				Code:       scholar.CodeAmbiguous,
-				Message:    fmt.Sprintf("%d different papers match the title %q", len(others)+1, n.title),
-				Hint:       evidenceHint,
-				Candidates: listed(strong),
+			top, ok := dominantGroup(groups, best.positives())
+			if !ok {
+				return nil, scholar.MatchInfo{}, nil, &scholar.ToolError{
+					Code:       scholar.CodeAmbiguous,
+					Message:    fmt.Sprintf("%d different papers match the title %q", len(groups), n.title),
+					Hint:       evidenceHint,
+					Candidates: listed(strong),
+				}
 			}
+			dominant = true
+			versions = groups[top]
+			best = versions[0]
+			others = flatten(append(append([][]*titleCandidate{}, groups[:top]...), groups[top+1:]...))
 		}
 	}
 
@@ -796,7 +800,10 @@ func decideTitle(n *normalized, cands []*titleCandidate) ([]*titleCandidate, sch
 	if len(versions) > 1 {
 		evidence = append(evidence, fmt.Sprintf("%d records treated as versions of the same paper", len(versions)))
 	}
-	if len(others) > 0 {
+	switch {
+	case dominant:
+		evidence = append(evidence, fmt.Sprintf("cited by %d, at least %dx each of %d other same-title paper(s)", *best.Cited, scholar.DominanceRatio, len(groups)-1))
+	case len(others) > 0:
 		evidence = append(evidence, fmt.Sprintf("author/year evidence excluded %d same-title paper(s)", len(others)))
 	}
 	method, confidence := "title_exact", "medium"
@@ -809,7 +816,87 @@ func decideTitle(n *normalized, cands []*titleCandidate) ([]*titleCandidate, sch
 	if best.sim < 0.97 && best.positives() == 0 {
 		confidence = "low"
 	}
-	return versions, scholar.MatchInfo{Method: method, Confidence: confidence, Evidence: evidence}, nil
+	match := scholar.MatchInfo{Method: method, Confidence: confidence, Evidence: evidence}
+	if !dominant {
+		return versions, match, nil, nil
+	}
+	match.Confidence = "medium"
+	match.Alternatives = listed(others)
+	warning := fmt.Sprintf("%d other paper(s) share this title (see identity.match.alternatives); selected %s because it has at least %dx the citations of each. Call again with doi or openalex_id to read another.",
+		len(groups)-1, firstNonEmpty(best.OpenAlexID, prefixed("doi:", best.DOI), best.Title), scholar.DominanceRatio)
+	return versions, match, []string{warning}, nil
+}
+
+// minDominantPaperCitations keeps the dominance tie-break from choosing
+// between barely cited records, where the counts say little.
+const minDominantPaperCitations = 50
+
+// versionGroups clusters strong title hits into papers: each hit joins the
+// first group whose leader it is a version of, so groups[0] is led by the
+// best-ranked hit.
+func versionGroups(strong []*titleCandidate) [][]*titleCandidate {
+	var groups [][]*titleCandidate
+next:
+	for _, c := range strong {
+		for i, g := range groups {
+			if sameWorkVersions(g[0], c) {
+				groups[i] = append(g, c)
+				continue next
+			}
+		}
+		groups = append(groups, []*titleCandidate{c})
+	}
+	return groups
+}
+
+func flatten(groups [][]*titleCandidate) []*titleCandidate {
+	out := []*titleCandidate{}
+	for _, g := range groups {
+		out = append(out, g...)
+	}
+	return out
+}
+
+// dominantGroup returns the paper whose citation count (its most-cited
+// version) is at least minDominantPaperCitations and DominanceRatio times
+// every other paper's, reordering that group so its most-cited record comes
+// first. It fails when any paper's count is unknown, or when the dominant
+// paper has weaker author/year evidence (fewer than minPositives) than the
+// best-ranked hit: citations never override identifying evidence.
+func dominantGroup(groups [][]*titleCandidate, minPositives int) (int, bool) {
+	cites := make([]int, len(groups))
+	top := -1
+	for i, g := range groups {
+		sort.SliceStable(g, func(a, b int) bool { return citedOrMinus(g[a]) > citedOrMinus(g[b]) })
+		if g[0].Cited == nil {
+			return -1, false
+		}
+		cites[i] = *g[0].Cited
+		if top < 0 || cites[i] > cites[top] {
+			top = i
+		}
+	}
+	if cites[top] < minDominantPaperCitations {
+		return -1, false
+	}
+	for i, c := range cites {
+		if i != top && cites[top] < scholar.DominanceRatio*c {
+			return -1, false
+		}
+	}
+	for _, c := range groups[top] {
+		if c.positives() >= minPositives {
+			return top, true
+		}
+	}
+	return -1, false
+}
+
+func citedOrMinus(c *titleCandidate) int {
+	if c.Cited == nil {
+		return -1
+	}
+	return *c.Cited
 }
 
 func (res *resolution) resolveTitle(ctx context.Context, fetcher DocFetcher, n *normalized) *scholar.ToolError {
@@ -833,7 +920,7 @@ func (res *resolution) resolveTitle(ctx context.Context, fetcher DocFetcher, n *
 			w := resp.Results[i]
 			doi, _ := normalizeDOI(w.DOI)
 			oa, _ := scholar.NormalizeOpenAlexID(w.ID)
-			cands = append(cands, &titleCandidate{Title: w.DisplayTitle(), Year: w.PublicationYear, Authors: w.AuthorNames(), DOI: doi, OpenAlexID: oa, Provider: "openalex", work: &w})
+			cands = append(cands, &titleCandidate{Title: w.DisplayTitle(), Year: w.PublicationYear, Authors: w.AuthorNames(), DOI: doi, OpenAlexID: oa, Cited: w.CitedByCount, Provider: "openalex", work: &w})
 		}
 	} else {
 		// OpenAlex unavailable: Crossref can still identify the DOI.
@@ -850,12 +937,13 @@ func (res *resolution) resolveTitle(ctx context.Context, fetcher DocFetcher, n *
 		}
 	}
 
-	chosen, match, err := decideTitle(n, cands)
+	chosen, match, warnings, err := decideTitle(n, cands)
 	if err != nil {
 		err.Attempts = res.Attempts
 		return err
 	}
 	res.Identity.Match = match
+	res.Warnings = append(res.Warnings, warnings...)
 	primary := chosen[0]
 	if primary.work != nil {
 		res.applyWork(*primary.work, true)
@@ -975,10 +1063,13 @@ func attemptFor(provider, stage, rawURL string, status int, err *scholar.ToolErr
 // fetchJSON GETs a JSON API endpoint. The HTTP status is returned alongside
 // the error so callers can special-case 404 (unknown DOI).
 func fetchJSON(ctx context.Context, fetcher DocFetcher, apiURL string, out any) (int, *scholar.ToolError) {
-	doc, err := fetcher.GetDocument(ctx, apiURL)
+	doc, err := fetcher.GetJSON(ctx, apiURL)
 	if err != nil {
 		if ctxErr := scholar.ContextError(err, "request to "+hostOf(apiURL)); ctxErr != nil {
 			return 0, ctxErr
+		}
+		if errors.Is(err, scholar.ErrBodyTooLarge) {
+			return 0, &scholar.ToolError{Code: scholar.CodeUpstreamError, Message: hostOf(apiURL) + " response exceeded the size limit", Hint: "Raise RESEARCHER_MAX_RESPONSE_MB if this is expected."}
 		}
 		return 0, &scholar.ToolError{Code: scholar.CodeUpstreamError, Message: fmt.Sprintf("request to %s failed: %s", hostOf(apiURL), scholar.RedactText(err.Error())), Retryable: true}
 	}
