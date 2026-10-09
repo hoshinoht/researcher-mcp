@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -11,43 +12,108 @@ import (
 	"strings"
 	"unicode"
 
+	"googlescholar-mcp-go/internal/config"
+
 	"github.com/PuerkitoBio/goquery"
 )
 
-func SearchByKeywords(ctx context.Context, requester *Requester, query string, numResults int) ([]PaperResult, *ToolError) {
-	if batchQuery, ok := quotedTitleBatchQuery(query); ok {
-		return searchOpenAlex(ctx, requester, batchQuery, "", nil, numResults)
-	}
-
-	searchURL := buildSearchURL(query, "", nil)
-	return searchWithFallback(ctx, requester, searchURL, query, "", nil, numResults)
+// SearchRequest is an article search across the configured providers.
+type SearchRequest struct {
+	Query      string
+	Author     string
+	YearRange  []int
+	NumResults int
 }
 
-func SearchAdvanced(ctx context.Context, requester *Requester, query, author string, yearRange []int, numResults int) ([]PaperResult, *ToolError) {
-	if batchQuery, ok := quotedTitleBatchQuery(query); ok {
-		return searchOpenAlex(ctx, requester, batchQuery, author, yearRange, numResults)
-	}
-
-	searchURL := buildSearchURL(query, author, yearRange)
-	return searchWithFallback(ctx, requester, searchURL, query, author, yearRange, numResults)
+// SearchOutcome carries results plus which provider produced them and what
+// was tried before it.
+type SearchOutcome struct {
+	Results   []PaperResult
+	Provider  string
+	Providers []string
+	Attempts  []Attempt
 }
 
-func searchWithFallback(ctx context.Context, requester *Requester, scholarURL, query, author string, yearRange []int, numResults int) ([]PaperResult, *ToolError) {
-	results, scholarErr := searchScholar(ctx, requester, scholarURL, numResults)
-	if scholarErr == nil {
-		return results, nil
+// SearchByKeywords searches with the requester's configured provider order.
+func SearchByKeywords(ctx context.Context, requester *Requester, query string, numResults int) (*SearchOutcome, *ToolError) {
+	return Search(ctx, requester, SearchRequest{Query: query, NumResults: numResults}, requester.cfg.SearchProviders)
+}
+
+// SearchAdvanced searches with author and year filters using the configured
+// provider order.
+func SearchAdvanced(ctx context.Context, requester *Requester, query, author string, yearRange []int, numResults int) (*SearchOutcome, *ToolError) {
+	return Search(ctx, requester, SearchRequest{Query: query, Author: author, YearRange: yearRange, NumResults: numResults}, requester.cfg.SearchProviders)
+}
+
+// Search tries providers in order and returns the first usable result set.
+// Recoverable failures (blocked, no results, upstream or parse errors) fall
+// through to the next provider; the most informative failure is returned
+// when every provider fails.
+func Search(ctx context.Context, requester *Requester, req SearchRequest, providers []string) (*SearchOutcome, *ToolError) {
+	if len(providers) == 0 {
+		providers = config.DefaultSearchProviders(false)
+	}
+	if req.NumResults <= 0 {
+		req.NumResults = 5
 	}
 
-	if !shouldFallbackToOpenAlex(scholarErr.Code) {
-		return nil, scholarErr
+	// A batch of quoted titles is an OpenAlex OR query; other providers would
+	// treat it as one long phrase.
+	if batchQuery, ok := quotedTitleBatchQuery(req.Query); ok && containsString(providers, config.ProviderOpenAlex) {
+		req.Query = batchQuery
+		providers = []string{config.ProviderOpenAlex}
 	}
 
-	openAlexResults, openAlexErr := searchOpenAlex(ctx, requester, query, author, yearRange, numResults)
-	if openAlexErr == nil {
-		return openAlexResults, nil
+	outcome := &SearchOutcome{Providers: providers}
+	var best *ToolError
+	for _, provider := range providers {
+		var (
+			results []PaperResult
+			toolErr *ToolError
+		)
+		switch provider {
+		case config.ProviderScholar:
+			results, toolErr = searchScholar(ctx, requester, buildSearchURL(req.Query, req.Author, req.YearRange), req.NumResults)
+		case config.ProviderOpenAlex:
+			results, toolErr = searchOpenAlex(ctx, requester, req.Query, req.Author, req.YearRange, req.NumResults)
+		case config.ProviderCrossref:
+			results, toolErr = searchCrossref(ctx, requester, req)
+		default:
+			continue
+		}
+		if toolErr == nil {
+			outcome.Attempts = AppendAttempt(outcome.Attempts, Attempt{Provider: provider, Stage: "search", Outcome: "ok"})
+			outcome.Results = results
+			outcome.Provider = provider
+			return outcome, nil
+		}
+		outcome.Attempts = AppendAttempt(outcome.Attempts, Attempt{Provider: provider, Stage: "search", Outcome: toolErr.Code, Message: toolErr.Message})
+		if ctxErr := ContextError(ctx.Err(), "article search"); ctxErr != nil {
+			ctxErr.Attempts = outcome.Attempts
+			return nil, ctxErr
+		}
+		if MoreInformative(toolErr, best) {
+			best = toolErr
+		}
+		if !shouldFallbackSearch(toolErr.Code) {
+			break
+		}
 	}
+	if best == nil {
+		best = &ToolError{Code: CodeNoResults, Message: "no results found"}
+	}
+	out := *best
+	out.Attempts = outcome.Attempts
+	return nil, &out
+}
 
-	return nil, openAlexErr
+func containsString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 func searchScholar(ctx context.Context, requester *Requester, searchURL string, numResults int) ([]PaperResult, *ToolError) {
@@ -55,14 +121,15 @@ func searchScholar(ctx context.Context, requester *Requester, searchURL string, 
 		return nil, &ToolError{Code: "invalid_input", Message: "search URL is empty"}
 	}
 
-	body, status, err := requester.Get(ctx, searchURL)
+	doc, err := requester.Get(ctx, searchURL)
 	if err != nil {
-		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("request failed: %v", err)}
+		return nil, requestError("google scholar", err)
 	}
+	body, status := doc.Body, doc.Status
 
 	if status != http.StatusOK {
 		if status == http.StatusForbidden || status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
-			return nil, BuildBlockedError(status)
+			return nil, BuildBlockedError(doc)
 		}
 		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("request failed with status %d", status)}
 	}
@@ -74,7 +141,7 @@ func searchScholar(ctx context.Context, requester *Requester, searchURL string, 
 
 	if len(results) == 0 {
 		if looksLikeBlocked(body) {
-			return nil, &ToolError{Code: "blocked", Message: "Google Scholar appears to have blocked this automated request"}
+			return nil, &ToolError{Code: "blocked", Message: "Google Scholar appears to have blocked this automated request", Retryable: true}
 		}
 		return nil, &ToolError{Code: "no_results", Message: "no results found"}
 	}
@@ -82,50 +149,58 @@ func searchScholar(ctx context.Context, requester *Requester, searchURL string, 
 	return results, nil
 }
 
-func shouldFallbackToOpenAlex(code string) bool {
+func shouldFallbackSearch(code string) bool {
 	switch code {
-	case "blocked", "no_results", "upstream_error", "parse_failed":
+	case CodeBlocked, CodeNoResults, CodeUpstreamError, CodeParseFailed, CodeTimeout:
 		return true
 	default:
 		return false
 	}
 }
 
+// requestError converts a transport error into a structured error.
+func requestError(provider string, err error) *ToolError {
+	if ctxErr := ContextError(err, provider+" request"); ctxErr != nil {
+		return ctxErr
+	}
+	if errors.Is(err, ErrBodyTooLarge) {
+		return &ToolError{Code: CodeUpstreamError, Message: provider + " response exceeded the size limit", Hint: "Raise RESEARCHER_MAX_RESPONSE_MB if this is expected."}
+	}
+	return &ToolError{Code: CodeUpstreamError, Message: fmt.Sprintf("%s request failed: %s", provider, RedactText(err.Error())), Retryable: true}
+}
+
+// statusError converts a non-200 API response into a structured error,
+// passing on any Retry-After wait the requester could not honour.
+func statusError(provider string, doc *FetchedDoc) *ToolError {
+	switch status := doc.Status; status {
+	case http.StatusTooManyRequests:
+		return &ToolError{Code: CodeBlocked, Message: fmt.Sprintf("%s rate limited the request (status 429)", provider), Hint: "Configure provider credentials (see README) or retry later.", Retryable: true, RetryAfterSeconds: retryAfterSeconds(doc)}
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return &ToolError{Code: CodeUpstreamError, Message: fmt.Sprintf("%s rejected the request (status %d)", provider, status), Hint: "Check the provider credential configured for this server."}
+	}
+	return &ToolError{Code: CodeUpstreamError, Message: fmt.Sprintf("%s request failed with status %d", provider, doc.Status), Retryable: doc.Status >= 500}
+}
+
+// retryAfterSeconds rounds the response's unhonoured Retry-After to whole
+// seconds; zero (omitted from JSON) when there was none.
+func retryAfterSeconds(doc *FetchedDoc) int {
+	return int(doc.RetryAfter.Seconds() + 0.5)
+}
+
 type openAlexWorksSearchResponse struct {
-	Results []openAlexWorkResult `json:"results"`
-}
-
-type openAlexAuthorship struct {
-	Author struct {
-		DisplayName string `json:"display_name"`
-	} `json:"author"`
-}
-
-type openAlexWorkResult struct {
-	ID                    string               `json:"id"`
-	DOI                   string               `json:"doi"`
-	DisplayName           string               `json:"display_name"`
-	PublicationYear       int                  `json:"publication_year"`
-	AbstractInvertedIndex map[string][]int     `json:"abstract_inverted_index"`
-	Authorships           []openAlexAuthorship `json:"authorships"`
-	PrimaryLocation       struct {
-		LandingPageURL string `json:"landing_page_url"`
-		PDFURL         string `json:"pdf_url"`
-	} `json:"primary_location"`
-	BestOALocation *struct {
-		PDFURL string `json:"pdf_url"`
-	} `json:"best_oa_location"`
+	Results []OpenAlexWork `json:"results"`
 }
 
 func searchOpenAlex(ctx context.Context, requester *Requester, query, author string, yearRange []int, numResults int) ([]PaperResult, *ToolError) {
 	searchURL := buildOpenAlexSearchURL(query, author, yearRange, numResults)
-	body, status, err := requester.Get(ctx, searchURL)
+	doc, err := requester.Get(ctx, searchURL)
 	if err != nil {
-		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("openalex request failed: %v", err)}
+		return nil, requestError("openalex", err)
 	}
-	if status != http.StatusOK {
-		return nil, &ToolError{Code: "upstream_error", Message: fmt.Sprintf("openalex request failed with status %d", status)}
+	if doc.Status != http.StatusOK {
+		return nil, statusError("openalex", doc)
 	}
+	body := doc.Body
 
 	var resp openAlexWorksSearchResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -141,12 +216,12 @@ func searchOpenAlex(ctx context.Context, requester *Requester, query, author str
 			break
 		}
 
-		title := normalizeSpace(item.DisplayName)
+		title := item.DisplayTitle()
 		if title == "" {
 			title = "No title available"
 		}
 
-		authors := openAlexAuthorsToString(item.Authorships)
+		authors := strings.Join(item.AuthorNames(), ", ")
 		if authors == "" {
 			authors = "No authors available"
 		}
@@ -165,10 +240,11 @@ func searchOpenAlex(ctx context.Context, requester *Requester, query, author str
 		if item.BestOALocation != nil {
 			pdfURL = strings.TrimSpace(item.BestOALocation.PDFURL)
 		}
-		if pdfURL == "" {
+		if pdfURL == "" && item.PrimaryLocation != nil {
 			pdfURL = strings.TrimSpace(item.PrimaryLocation.PDFURL)
 		}
 
+		openAlexID, _ := NormalizeOpenAlexID(item.ID)
 		results = append(results, PaperResult{
 			Title:            title,
 			Authors:          authors,
@@ -178,6 +254,8 @@ func searchOpenAlex(ctx context.Context, requester *Requester, query, author str
 			Year:             item.PublicationYear,
 			PDFURL:           pdfURL,
 			SnippetTruncated: false,
+			Source:           config.ProviderOpenAlex,
+			OpenAlexID:       openAlexID,
 		})
 	}
 
@@ -254,23 +332,6 @@ func quotedTitleBatchQuery(query string) (string, bool) {
 	return strings.Join(phrases, " OR "), true
 }
 
-func openAlexAuthorsToString(authorships []openAlexAuthorship) string {
-	names := make([]string, 0, len(authorships))
-	seen := map[string]struct{}{}
-	for _, authorship := range authorships {
-		name := normalizeSpace(authorship.Author.DisplayName)
-		if name == "" {
-			continue
-		}
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
-		names = append(names, name)
-	}
-	return strings.Join(names, ", ")
-}
-
 func normalizeDOIString(raw string) string {
 	doi := strings.TrimSpace(raw)
 	doi = strings.TrimPrefix(doi, "https://doi.org/")
@@ -278,17 +339,17 @@ func normalizeDOIString(raw string) string {
 	return doi
 }
 
-func openAlexResultURL(item openAlexWorkResult) string {
+func openAlexResultURL(item OpenAlexWork) string {
 	if strings.TrimSpace(item.DOI) != "" {
 		doi := strings.TrimSpace(item.DOI)
 		doi = strings.TrimPrefix(doi, "https://doi.org/")
 		doi = strings.TrimPrefix(doi, "http://doi.org/")
 		return "https://doi.org/" + doi
 	}
-	if strings.TrimSpace(item.PrimaryLocation.LandingPageURL) != "" {
+	if item.PrimaryLocation != nil && strings.TrimSpace(item.PrimaryLocation.LandingPageURL) != "" {
 		return strings.TrimSpace(item.PrimaryLocation.LandingPageURL)
 	}
-	if strings.TrimSpace(item.PrimaryLocation.PDFURL) != "" {
+	if item.PrimaryLocation != nil && strings.TrimSpace(item.PrimaryLocation.PDFURL) != "" {
 		return strings.TrimSpace(item.PrimaryLocation.PDFURL)
 	}
 	if strings.TrimSpace(item.ID) != "" {
@@ -379,6 +440,7 @@ func parseSearchResultsHTML(html []byte, numResults int) ([]PaperResult, error) 
 			Abstract:         abstract,
 			URL:              link,
 			SnippetTruncated: looksLikeTruncatedSnippet(abstract),
+			Source:           "google_scholar",
 		})
 		return true
 	})

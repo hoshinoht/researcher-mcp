@@ -1,0 +1,7 @@
+{"results":[
+ {"id":"https://openalex.org/W20","display_name":"Deep Learning","publication_year":2015,"doi":"https://doi.org/10.1038/nature14539",
+  "authorships":[{"author":{"display_name":"Yann LeCun"}},{"author":{"display_name":"Yoshua Bengio"}},{"author":{"display_name":"Geoffrey Hinton"}}],
+  "best_oa_location":{"is_oa":true,"pdf_url":"https://repo.example.org/lecun2015.pdf"}},
+ {"id":"https://openalex.org/W21","display_name":"Deep Learning","publication_year":2018,"doi":"https://doi.org/10.5555/goodfellow",
+  "authorships":[{"author":{"display_name":"Ian Goodfellow"}},{"author":{"display_name":"Aaron Courville"}}]}
+]}

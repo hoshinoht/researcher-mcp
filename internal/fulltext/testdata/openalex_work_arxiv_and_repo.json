@@ -1,0 +1,11 @@
+{"id":"https://openalex.org/W30","display_name":"Robust Paper","publication_year":2020,"doi":"https://doi.org/10.1000/robust",
+ "ids":{"openalex":"https://openalex.org/W30","doi":"https://doi.org/10.1000/robust"},
+ "authorships":[{"author":{"id":"https://openalex.org/A30","display_name":"Rob Ust"}}],
+ "primary_location":{"is_oa":false,"landing_page_url":"https://doi.org/10.1000/robust"},
+ "best_oa_location":{"is_oa":true,"version":"submittedVersion","landing_page_url":"https://arxiv.org/abs/2001.00001","pdf_url":"https://arxiv.org/pdf/2001.00001"},
+ "locations":[
+  {"is_oa":true,"version":"submittedVersion","landing_page_url":"https://arxiv.org/abs/2001.00001","pdf_url":"https://arxiv.org/pdf/2001.00001"},
+  {"is_oa":true,"version":"acceptedVersion","landing_page_url":"https://repository.example.edu/item/30","pdf_url":"https://repository.example.edu/bitstream/30/robust.pdf"}
+ ],
+ "open_access":{"is_oa":true,"oa_url":"https://arxiv.org/pdf/2001.00001"},
+ "abstract_inverted_index":{"Robust":[0],"abstract.":[1]}}

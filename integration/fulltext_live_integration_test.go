@@ -41,7 +41,10 @@ func TestGetPaperContentArxivLive(t *testing.T) {
 	if !strings.Contains(strings.ToLower(content.Markdown), "attention") {
 		t.Fatalf("markdown does not mention attention; source=%s converter=%s", content.SourceURL, content.Converter)
 	}
-	t.Logf("source=%s type=%s converter=%s total_chars=%d", content.SourceURL, content.SourceType, content.Converter, content.TotalChars)
+	t.Logf("source=%s type=%s converter=%s status=%s total_chars=%d", content.SourceURL, content.SourceType, content.Converter, content.ContentStatus, content.TotalChars)
+	if content.ContentStatus != fulltext.StatusFullText {
+		t.Fatalf("content_status = %s, want full_text", content.ContentStatus)
+	}
 }
 
 func TestGetPaperContentPaginationRoundTripLive(t *testing.T) {
@@ -81,8 +84,9 @@ func TestGetPaperContentDOILive(t *testing.T) {
 	if toolErr != nil {
 		t.Fatalf("GetPaperContent error: %+v", toolErr)
 	}
-	if content.TotalChars < 2000 {
-		t.Fatalf("suspiciously short content: %d chars from %s", content.TotalChars, content.SourceURL)
+	t.Logf("source=%s status=%s identity=%+v", content.SourceURL, content.ContentStatus, content.Identity)
+	if content.ContentStatus != fulltext.StatusFullText {
+		t.Fatalf("content_status = %s from %s (warnings %v)", content.ContentStatus, content.SourceURL, content.Warnings)
 	}
 }
 
@@ -93,10 +97,11 @@ func TestGetPaperContentTitleLive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	content, toolErr := svc.GetPaperContent(ctx, fulltext.Request{Title: "Attention Is All You Need"}, 0, 0)
+	content, toolErr := svc.GetPaperContent(ctx, fulltext.Request{Title: "Attention Is All You Need", Author: "Vaswani", Year: 2017}, 0, 0)
 	if toolErr != nil {
 		t.Fatalf("GetPaperContent error: %+v", toolErr)
 	}
+	t.Logf("identity=%+v", content.Identity)
 	if !strings.Contains(strings.ToLower(content.Markdown), "attention") {
 		t.Fatalf("markdown does not mention attention; source=%s", content.SourceURL)
 	}

@@ -1,0 +1,9 @@
+{"results":[
+ {"id":"https://openalex.org/W4390000001","display_name":"Attention Is All You Need","publication_year":2023,"doi":"https://doi.org/10.5281/zenodo.0000001","cited_by_count":0,"authorships":[]},
+ {"id":"https://openalex.org/W2626778328","display_name":"Attention Is All You Need","publication_year":2017,"doi":"https://doi.org/10.48550/arxiv.1706.03762","cited_by_count":120000,
+  "authorships":[{"author":{"id":"https://openalex.org/A11","display_name":"Ashish Vaswani"}},{"author":{"id":"https://openalex.org/A12","display_name":"Noam Shazeer"}}],
+  "locations":[{"is_oa":true,"landing_page_url":"https://arxiv.org/abs/1706.03762","pdf_url":"https://arxiv.org/pdf/1706.03762"}]},
+ {"id":"https://openalex.org/W4390000002","display_name":"Attention is all you need","publication_year":2021,"cited_by_count":3,
+  "authorships":[{"author":{"id":"https://openalex.org/A13","display_name":"Jane Doe"}}],
+  "best_oa_location":{"is_oa":true,"pdf_url":"https://books.example.org/attention.pdf"}}
+]}

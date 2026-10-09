@@ -30,12 +30,9 @@ func newTestRequester(rt http.RoundTripper) *Requester {
 		Timeout:          2 * time.Second,
 	}
 
-	return &Requester{
-		cfg:        cfg,
-		client:     &http.Client{Transport: rt, Timeout: cfg.Timeout},
-		lastByHost: make(map[string]time.Time),
-		rng:        rand.New(rand.NewSource(1)),
-	}
+	r := NewRequesterWithTransport(cfg, rt)
+	r.rng = rand.New(rand.NewSource(1))
+	return r
 }
 
 func httpResponse(status int, body string) *http.Response {
@@ -66,7 +63,7 @@ func TestGetAuthorInfo_SplitsCommaSeparatedNames(t *testing.T) {
 		}
 	}))
 
-	author, toolErr := GetAuthorInfo(context.Background(), requester, "Ying Li, Lei Wu")
+	author, toolErr := GetAuthorInfo(context.Background(), requester, AuthorQuery{Name: "Ying Li, Lei Wu"})
 	if toolErr != nil {
 		t.Fatalf("unexpected tool error: %+v", toolErr)
 	}
@@ -75,6 +72,9 @@ func TestGetAuthorInfo_SplitsCommaSeparatedNames(t *testing.T) {
 	}
 	if author.Name != "Ying Li" {
 		t.Fatalf("expected Ying Li, got %q", author.Name)
+	}
+	if len(author.Warnings) == 0 || !strings.Contains(author.Warnings[0], "2 people") {
+		t.Fatalf("expected a warning that only the first person was looked up, got %v", author.Warnings)
 	}
 	if len(searched) == 0 || searched[0] != "Ying Li" {
 		t.Fatalf("expected first OpenAlex query to be split candidate, got %v", searched)
@@ -95,7 +95,7 @@ func TestGetAuthorInfo_OpenAlexChoosesBestNameMatch(t *testing.T) {
 		return httpResponse(http.StatusOK, `{"results":[{"id":"https://openalex.org/A1","display_name":"Xuedong Zhou","works_count":90,"cited_by_count":300,"works_api_url":""},{"id":"https://openalex.org/A2","display_name":"Andrew Y. Ng","works_count":200,"cited_by_count":25000,"works_api_url":""}]}`), nil
 	}))
 
-	author, toolErr := GetAuthorInfo(context.Background(), requester, "Andrew Ng")
+	author, toolErr := GetAuthorInfo(context.Background(), requester, AuthorQuery{Name: "Andrew Ng"})
 	if toolErr != nil {
 		t.Fatalf("unexpected tool error: %+v", toolErr)
 	}
@@ -108,7 +108,7 @@ func TestGetAuthorInfo_OpenAlexChoosesBestNameMatch(t *testing.T) {
 }
 
 func TestSplitAuthorNameCandidates_SpecialCharactersAndEmptyParts(t *testing.T) {
-	got := splitAuthorNameCandidates("  Jos\u00e9 Garc\u00eda , Fran\u00e7ois Dupont , ,  ")
+	got := SplitPeople("  Jos\u00e9 Garc\u00eda , Fran\u00e7ois Dupont , ,  ")
 	if len(got) != 2 {
 		t.Fatalf("expected 2 candidates, got %d (%v)", len(got), got)
 	}
@@ -121,7 +121,7 @@ func TestSplitAuthorNameCandidates_SpecialCharactersAndEmptyParts(t *testing.T) 
 }
 
 func TestGetAuthorInfo_EmptyNameReturnsInvalidInput(t *testing.T) {
-	author, toolErr := GetAuthorInfo(context.Background(), nil, "   ")
+	author, toolErr := GetAuthorInfo(context.Background(), nil, AuthorQuery{Name: "   "})
 	if toolErr == nil {
 		t.Fatalf("expected invalid_input error")
 	}
@@ -149,7 +149,7 @@ func TestGetAuthorInfo_PreservesParseFailureWhenFallbacksHaveNoResults(t *testin
 		}
 	}))
 
-	author, toolErr := GetAuthorInfo(context.Background(), requester, "Any Name")
+	author, toolErr := GetAuthorInfo(context.Background(), requester, AuthorQuery{Name: "Any Name"})
 	if author != nil {
 		t.Fatalf("expected nil author when providers fail")
 	}
@@ -166,7 +166,7 @@ func TestGetAuthorInfo_ReturnsUpstreamErrorWhenProvidersUnreachable(t *testing.T
 		return nil, errors.New("dial timeout")
 	}))
 
-	author, toolErr := GetAuthorInfo(context.Background(), requester, "Andrew Ng")
+	author, toolErr := GetAuthorInfo(context.Background(), requester, AuthorQuery{Name: "Andrew Ng"})
 	if author != nil {
 		t.Fatalf("expected nil author when upstream is unreachable")
 	}
